@@ -19,8 +19,8 @@ jobs:
           java-version: "21"
       - name: Install Kaitai Struct Compiler 0.11
         run: |
-          curl -fsSLO https://github.com/kaitai-io/kaitai_struct_compiler/releases/download/0.11/kaitai-struct-compiler_0.11_all.deb
-          sudo apt-get install -y ./kaitai-struct-compiler_0.11_all.deb
+          curl -fsSL https://github.com/kaitai-io/kaitai_struct_compiler/releases/download/0.11/kaitai-struct-compiler_0.11_all.deb -o "$RUNNER_TEMP/kaitai-struct-compiler.deb"
+          sudo apt-get install -y "$RUNNER_TEMP/kaitai-struct-compiler.deb"
       - run: python3 tools/validate_public_tree.py .
       - run: python3 -m unittest discover -s tests -p 'test_*.py'
       - name: Generate supported Kaitai targets

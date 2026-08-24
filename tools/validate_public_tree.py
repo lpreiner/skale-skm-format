@@ -83,6 +83,11 @@ def validate(root: Path) -> None:
 
     for path in root.rglob("*"):
         rel = path.relative_to(root)
+        # A normal source checkout contains repository metadata at its root.
+        # Ignore that one administrative tree, while continuing to reject
+        # nested .git directories in distributed content.
+        if rel.parts and rel.parts[0] == ".git":
+            continue
         if path.is_symlink():
             raise ValueError(f"symlink is not allowed: {rel}")
         if any(part in FORBIDDEN_PARTS for part in rel.parts):

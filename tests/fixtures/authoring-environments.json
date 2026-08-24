@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "license": "CC0-1.0",
+  "environments": [
+    {
+      "id": "macos-tahoe-26.5.2-wine-11.0",
+      "operating_system": "macOS Tahoe 26.5.2",
+      "wine_version": "11.0",
+      "applies_to": [
+        "empty-skale-070-first.skm",
+        "empty-skale-070-resaved.skm",
+        "empty-skale-071-first.skm",
+        "empty-skale-071-resaved.skm",
+        "empty-skale-075-first.skm",
+        "empty-skale-075-resaved.skm",
+        "empty-skale-076-first.skm",
+        "empty-skale-076-resaved.skm",
+        "empty-skale-080-first.skm",
+        "empty-skale-080-resaved.skm",
+        "empty-skale-0802-first.skm",
+        "empty-skale-0802-resaved.skm",
+        "empty-skale-081-first.skm",
+        "empty-skale-081-resaved.skm"
+      ]
+    }
+  ]
+}

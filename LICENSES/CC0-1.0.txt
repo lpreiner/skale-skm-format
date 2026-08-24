@@ -1,0 +1,11 @@
+Creative Commons Zero v1.0 Universal
+
+SPDX-License-Identifier: CC0-1.0
+
+Canonical legal code:
+https://creativecommons.org/publicdomain/zero/1.0/legalcode
+
+This working repository uses CC0-1.0 only for artifacts expressly identified
+by `LICENSE_POLICY.md`. It does not apply CC0 to third-party modules, Skale
+executables, private research-corpus material, or other rights that the
+contributors do not control.

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "license": "CC0-1.0",
+  "files_distributed": false,
+  "notice": "These factual hashes identify authoring applications only. No executable is distributed, licensed, or automatically downloaded.",
+  "executables": [
+    {
+      "application_version_label": "070",
+      "display_version": "0.70",
+      "filename": "Sk@le 0.7.exe",
+      "sha256": "1bb1079995d2f67e7951af028bb93e7947194621fa7cacd9f25c3b91ab65f74f"
+    },
+    {
+      "application_version_label": "071",
+      "display_version": "0.71",
+      "filename": "Sk@le 0.71.exe",
+      "sha256": "6999c3fe281addd68da6ad482a2dee38291ba686f27ce0acae6e78dbee8aefeb"
+    },
+    {
+      "application_version_label": "075",
+      "display_version": "0.75",
+      "filename": "Sk@le.exe",
+      "sha256": "f4a0cdeec196896e6bec05bdcb50bec39e6e58de01ee04fb0fe2798e6730fef2"
+    },
+    {
+      "application_version_label": "076",
+      "display_version": "0.76",
+      "filename": "Sk@le076wFixed.exe",
+      "sha256": "57695be3ead18d418142f778ac74d8fcbf084284aaf2f112ccf52e610405b20d"
+    },
+    {
+      "application_version_label": "080",
+      "display_version": "0.80",
+      "filename": "Skale.exe",
+      "sha256": "836588fb7a98350b5d5eb3e159cfe062b84f9532278ca1f54a489136683c5759"
+    },
+    {
+      "application_version_label": "0802",
+      "display_version": "0.802",
+      "filename": "Skale.exe",
+      "sha256": "cd6335f851d9f0be76b6c37b966a05c2f87416c4e50543ff364400e8b4829d94"
+    },
+    {
+      "application_version_label": "081",
+      "display_version": "0.81",
+      "filename": "Skale.exe",
+      "sha256": "0d16ecf15334dd696a8e20530407410997904f48d97702fe0acbd4253fb6bd19"
+    }
+  ],
+  "modules": []
+}

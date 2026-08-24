@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: CC0-1.0
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install Kaitai Struct Compiler 0.11
+        run: |
+          curl -fsSLO https://github.com/kaitai-io/kaitai_struct_compiler/releases/download/0.11/kaitai-struct-compiler_0.11_all.deb
+          sudo apt-get install -y ./kaitai-struct-compiler_0.11_all.deb
+      - run: python3 tools/validate_public_tree.py .
+      - run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: Generate supported Kaitai targets
+        run: |
+          test "$(kaitai-struct-compiler --version)" = "kaitai-struct-compiler 0.11"
+          mkdir -p build/kaitai/python build/kaitai/cpp_stl build/kaitai/csharp build/kaitai/javascript
+          kaitai-struct-compiler -t python --outdir build/kaitai/python kaitai/skm.ksy
+          kaitai-struct-compiler -t cpp_stl --outdir build/kaitai/cpp_stl kaitai/skm.ksy
+          kaitai-struct-compiler -t csharp --outdir build/kaitai/csharp kaitai/skm.ksy
+          kaitai-struct-compiler -t javascript --outdir build/kaitai/javascript kaitai/skm.ksy

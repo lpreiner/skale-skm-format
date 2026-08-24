@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+kaitai/gen/
+build/
+dist/
+renders/
+extracted/
+*.wav
+!tests/fixtures/audio/*.wav

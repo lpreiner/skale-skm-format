@@ -20,6 +20,26 @@ Synthetic and malformed fixtures test consumers. They are not evidence that
 Skale itself emits or accepts the mutated representation unless the manifest
 explicitly records a separate application-side observation.
 
+## What `expected_parse` means
+
+`expected_parse` records whether the **container framing** survives the
+mutation, not whether the payload is meaningful.
+
+- `success` — every length field still closes exactly, so a container parser
+  must read the file end to end. The damage is in payload semantics and belongs
+  to a later validation layer. `ogg-bad-magic`, `ogg-inner-length-overrun`, and
+  `ogg-missing-ff-padding` are all same-size in-place byte rewrites of an
+  authentic fixture: they still consume 17701/17701 bytes, and it is
+  `extract_ogg_stream`, not `parse_skm`, that rejects them.
+- `reject` — the framing itself is broken and no honest parser can continue.
+  `truncated-inside-ogg-stream` removes 1740 bytes, leaving a chunk that
+  declares 16804 bytes with 15536 available.
+
+This split is deliberate, and consumers are expected to preserve it. A module
+with one corrupt sample should still load and expose its remaining samples,
+with the bad one skipped; refusing an entire module over a few payload bytes is
+both less useful and a liability for a library that parses untrusted input.
+
 ## Adding a fixture
 
 1. Begin with a new song or an already-approved CC0 fixture.

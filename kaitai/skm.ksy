@@ -756,10 +756,72 @@ types:
         type: sample_metadata
       - id: audio_data
         size: metadata.audio_data_length
-        doc: Raw PCM data plus its fixed 5-byte inner tail, or the self-contained Ogg length/stream/padding payload.
+        doc: |
+          Raw PCM data plus its fixed 5-byte inner tail, or the self-contained
+          Ogg length/stream/padding payload.
+
+          Deliberately left as raw bytes. Decoding the Ogg framing here would
+          size a field from `inner_length`, an untrusted value, and a file that
+          declares a bad one would then fail during *container* parsing -- which
+          contradicts this repository's layering, where framing damage is the
+          container's to reject and payload damage belongs to a later
+          validation step. `tests/fixtures/generated/ogg-inner-length-overrun.skm`
+          is the case in point: its container closes exactly, and it is marked
+          `expected_parse: success`. Use the `ogg` instance below to decode the
+          framing, and treat a failure there as payload rejection.
       - id: trailer
         size: 3
         doc: Fixed record trailer, observed as 00 00 00.
+    instances:
+      ogg:
+        pos: sizeof<sample_metadata>
+        size: metadata.audio_data_length
+        type: ogg_payload
+        if: metadata.format == sample_format::ogg_vorbis
+        doc: |
+          Lazy Ogg framing decode. Evaluating this is the validation step: it
+          raises on a malformed `inner_length` rather than making the whole
+          container unparseable. Consumers that only need structure can ignore
+          it.
+
+  ogg_payload:
+    doc: |
+      Ogg Vorbis sample payload: an inner length, the self-contained Vorbis
+      stream, and Skale's fixed four-byte padding. The padding is counted
+      inside `inner_length`.
+
+      A decoder must be handed `stream` only. Passing the padding through --
+      even just the trailing two bytes -- can leave a push-mode Vorbis decoder
+      consuming nothing while reporting "need more data", which spins a
+      length-driven read loop forever after the audio has already been fully
+      decoded. Verified 1032/1032 corpus Ogg samples and 3/3 public fixtures.
+
+      Not currently reachable by this spec: every observed Ogg-bearing file is
+      `version_raw == 7600`, and 0.76 instrument bodies are still `remainder_raw`.
+      This type documents the verified layout and is already wired to
+      `audio_data`'s format switch, so it becomes live as soon as the 0.76
+      instrument prefix is decoded.
+    seq:
+      - id: inner_length
+        type: u4
+        doc: Byte count of `stream` plus `padding`.
+      - id: stream
+        size: inner_length - 4
+        doc: Complete self-contained Ogg/Vorbis stream, starting with `OggS` magic. Vorbis carries its own sample rate, so no external rate is needed.
+      - id: padding
+        size: 4
+        doc: |
+          Skale-owned padding after the real Ogg EOS, `01 00 FF FF` in every
+          conforming stream. Not Vorbis data; carries no audio.
+
+          Declared by size rather than by `contents`: this spec describes
+          container structure, and payload values are the consumer's to
+          validate. A file whose padding bytes are wrong is still structurally
+          well formed -- every length field still closes exactly -- so it
+          should parse here and be rejected by whatever reads the stream.
+          Asserting the value with `contents` would make a generated parser
+          refuse a structurally sound file, which neither the reference parser
+          nor the loader does.
 
   sample_metadata:
     doc: Verified fixed header immediately following a populated sample name.

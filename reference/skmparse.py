@@ -176,11 +176,12 @@ def parse_song_text(chunk):
         "channel_count": channel_count,
         "reserved": reserved,
         "version_raw": version_raw,
-        "zero_footer_raw": zero_footer.hex(),
+        "zero_footer_raw": zero_footer.hex() if zero_footer is not None else None,
+        "padding_length": padding_length,
         "canonical_layout": (
             separator_ok
             and zero_footer == b"\x00" * 10
-            and b"\x00" not in message_raw
+            and b"\x00" not in message_raw.rstrip(b"\x00")
         ),
         "trailer_raw": trailer.hex(),
     }
@@ -776,11 +777,18 @@ def extract_ogg_stream(raw, sample):
     """
     Return the raw Ogg/Vorbis stream bytes for an Ogg-format sample
     (format 4): audio_data[] is a u32 inner length followed by an
-    "OggS"-magic Vorbis stream followed by Skale's fixed FF FF padding
-    (§3.1). The returned bytes omit that padding and are a
-    complete, self-contained Ogg stream -- Vorbis embeds its own sample
-    rate in the stream's identification header, so (unlike raw PCM) no
-    external rate needs to be supplied to play or decode it.
+    "OggS"-magic Vorbis stream followed by Skale's fixed four-byte
+    `01 00 FF FF` padding (§3.1). The returned bytes omit all four
+    padding bytes and are a complete, self-contained Ogg stream -- Vorbis
+    embeds its own sample rate in the stream's identification header, so
+    (unlike raw PCM) no external rate needs to be supplied to play or
+    decode it.
+
+    The padding is four bytes, not two: 1032/1032 corpus Ogg samples and
+    3/3 public Ogg fixtures end `01 00 FF FF`. Omitting only the trailing
+    `FF FF` leaves `01 00` after the real Ogg EOS, which is enough to
+    make a push-mode Vorbis decoder consume nothing and report
+    "need more data" indefinitely (§3.1's 2026-08-25 correction).
 
     Raises ValueError if `sample` isn't a located Ogg sample, if the
     inner length overruns the sub-chunk's declared audio_data_length, or

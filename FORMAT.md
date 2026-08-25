@@ -219,9 +219,20 @@ PCM payloads may be signed 8-bit or signed little-endian 16-bit. The sample
 rate is represented through XM-compatible relative-note/finetune semantics
 rather than an explicit Hertz field.
 
-Embedded Ogg Vorbis is stored as a self-contained stream. All observed streams
-have two `FF` padding bytes after Ogg EOS within the stored inner length; a
-consumer should validate framing and exclude non-Ogg padding from the decoder.
+Embedded Ogg Vorbis is stored as a self-contained stream: a `u32` inner length,
+then an `OggS`-magic Vorbis stream, then **four** fixed padding bytes
+`01 00 FF FF`. The padding is counted inside the stored inner length. Every
+observed stream ends this way — 1032/1032 corpus Ogg samples and 3/3 public Ogg
+fixtures.
+
+A consumer must validate the framing and exclude **all four** padding bytes
+before handing the stream to a decoder. Excluding only the trailing `FF FF`
+leaves `01 00` after the real Ogg EOS. That is enough to make a push-mode
+Vorbis decoder consume nothing and return "need more data" without changing
+state — a caller that loops while bytes remain will then spin forever, with the
+audio already fully decoded. The padding is not part of the Vorbis stream and
+carries no audio, so excluding all four bytes is lossless: decoded sample counts
+are identical either way.
 
 ## Section 4: FX chain — Verified for the observed VST2 layout
 

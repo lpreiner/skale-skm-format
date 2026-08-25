@@ -38,7 +38,17 @@ def load_parser(root: Path):
         raise RuntimeError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    # Importing writes reference/__pycache__ unless bytecode is suppressed,
+    # and this script rejects __pycache__ as a forbidden path component. Since
+    # the tree walk runs before this point, a cache written here would pass the
+    # current run and fail the next one on an unchanged tree. Suppress it for
+    # the duration of the import so the validator cannot poison what it checks.
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = previous
     return module
 
 

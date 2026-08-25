@@ -99,36 +99,53 @@ types:
 
   song_text_section:
     doc: |
-      Top-level tag 1. Verified corpus-wide. Layout is front-anchored
-      (title, then an optional NUL separator, then a free-text message)
-      and back-anchored (a fixed 10-byte zero footer, then an 8-byte
-      timing/version trailer) -- `message`'s length is whatever's left
-      between them, computed from the chunk's own total size rather than
-      a stored length field.
+      Top-level tag 1. Layout is front-anchored (title, then an optional NUL
+      separator, then a free-text message) and back-anchored by the fixed
+      8-byte timing/version trailer. `message`'s length is whatever's left
+      between them, computed from the chunk's own total size rather than a
+      stored length field, and it is NUL-padded to reach the trailer.
+
+      The separator is optional in practice, so it is not a `seq` field: the
+      region between title and trailer is captured raw as `text_region`, and
+      `message` is an instance that skips a leading NUL only when one is
+      actually there. Consuming it unconditionally swallowed the first message
+      character of any file without a separator (fixed 2026-08-25; see
+      `tests/fixtures/generated/song-text-short-padding.skm`, which reads
+      "Msg" here and did read "sg").
+
+      The 10-byte zero footer is real and fixed-width for Skale-emitted files
+      (PROVENANCE.md section 1: inserting one extra zero shifts Skale's own
+      reader by exactly one byte). It is not modelled as a separate field here
+      because doing so requires reserving 10 bytes unconditionally, which
+      truncates the message of any file whose run is shorter -- as two
+      hand-authored probe fixtures are. Sizing `message` against the trailer
+      instead is correct for both, and callers rstrip the padding anyway.
     seq:
       - id: title
         type: strz
         encoding: ISO-8859-1
-      - id: separator
-        type: u1
-        doc: Expected 0 in the canonical layout; see `separator_ok`.
-      - id: message
-        size: _io.size - _io.pos - 18
-        type: str
-        encoding: ISO-8859-1
+      - id: text_region
+        size: _io.size - _io.pos - 8
         doc: >
-          Raw remaining bytes, NUL-padded to fill the gap before the
-          footer -- callers should rstrip trailing \x00 themselves
-          (skmparse.py's `canonical_layout` flags files where that padding
-          isn't clean, e.g. an embedded NUL mid-message).
-      - id: zero_footer
-        size: 10
-        doc: Fixed 10 zero bytes in the canonical layout (not contents-matched here since a handful of files deviate; see `canonical_layout`).
+          Everything between the title and the trailer: an optional single-NUL
+          separator, the message, and the NUL padding. Kept as raw bytes so the
+          separator can be skipped conditionally -- consuming it unconditionally
+          swallows the first message character in files that do not have one.
       - id: trailer
         type: trailer_t
     instances:
       separator_ok:
-        value: separator == 0
+        value: text_region.size > 0 and text_region[0] == 0
+        doc: True when a NUL separator follows the title, as in the canonical layout.
+      message:
+        pos: '_io.size - 8 - text_region.size + (separator_ok ? 1 : 0)'
+        size: 'text_region.size - (separator_ok ? 1 : 0)'
+        type: str
+        encoding: ISO-8859-1
+        doc: >
+          The message region, with the separator skipped only when one is
+          actually present. Still NUL-padded to reach the trailer; callers
+          rstrip trailing \x00 themselves.
 
   trailer_t:
     doc: The 8-byte tail of section 1 -- initial playback timing plus a second, redundant version stamp.

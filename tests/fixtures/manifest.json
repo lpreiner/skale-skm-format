@@ -998,6 +998,26 @@
       "license": "CC0-1.0"
     },
     {
+      "id": "song-text-minimal",
+      "kind": "synthetic-template-rewrite",
+      "source_rights_declaration_id": "empty-skale-seeds-2026-08-14",
+      "bytes": 892,
+      "sha256": "e15be0486700c3da3b2add8aec0a5f242bddfbc2b1e27e0b23b94012e9fef2e8",
+      "expected_parse": "success",
+      "path": "tests/fixtures/generated/song-text-minimal.skm",
+      "license": "CC0-1.0"
+    },
+    {
+      "id": "song-text-short-padding",
+      "kind": "synthetic-template-rewrite",
+      "source_rights_declaration_id": "empty-skale-seeds-2026-08-14",
+      "bytes": 903,
+      "sha256": "63976975216ea2066d9e68ddd704828269b6fd9e0ecbd3484e9e267950c75ff8",
+      "expected_parse": "success",
+      "path": "tests/fixtures/generated/song-text-short-padding.skm",
+      "license": "CC0-1.0"
+    },
+    {
       "id": "sparse-pattern-id-5",
       "kind": "synthetic-template-rewrite",
       "source_rights_declaration_id": "empty-skale-seeds-2026-08-14",

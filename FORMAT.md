@@ -52,11 +52,22 @@ The header payload is nine bytes:
 The payload is front- and back-anchored:
 
 1. NUL-terminated title.
-2. Canonical NUL separator.
+2. A NUL separator in the canonical layout. It is not always present, and a
+   consumer must test for it rather than skipping a byte unconditionally --
+   doing so swallows the first character of the message.
 3. Message bytes, normally NUL-padded.
 4. Ten-byte zero footer.
 5. Eight-byte trailer containing initial BPM, initial speed, channel count, a
    reserved zero byte, and a redundant `u32 version_raw`.
+
+Only item 5 is a fixed-width field a consumer may reserve. The footer is
+fixed-width in files Skale itself writes -- inserting one extra zero shifts
+Skale's own reader by exactly one byte -- but a consumer that reserves ten
+bytes truncates the message of any structurally valid file whose padding run
+is shorter, and one that requires those ten bytes to be zero rejects such a
+file entirely. Anchor the message on the trailer and strip trailing NULs
+instead. The smallest well-formed section is nine bytes: a title terminator
+plus the trailer.
 
 Existing evidence supports ISO-8859-1 as a conservative byte-to-text mapping,
 but the actual non-ASCII encoding still needs a controlled fixture.

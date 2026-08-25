@@ -16,6 +16,11 @@ Controlled empty and metadata fixtures establish the front/back-anchored song
 text layout, initial BPM, speed, channel count, redundant version stamp, and
 the visible-comment requirement for a terminating carriage return.
 
+`song-text-short-padding` and `song-text-minimal` establish the consumer-facing
+boundary: only the 8-byte trailer is a field a reader may reserve. Reserving the
+ten-byte footer truncates messages and rejects structurally valid files, and the
+NUL separator is not always present.
+
 ## 2. Orders and pattern sizes
 
 Generated fixtures establish authoritative song length, stale unused order

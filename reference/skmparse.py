@@ -157,17 +157,41 @@ def parse_header(chunk):
 
 
 def parse_song_text(chunk):
-    if len(chunk.data) < 18:
-        raise ValueError("song text chunk is too short for its footer and trailer")
-    text, zero_footer, trailer = (
-        chunk.data[:-18], chunk.data[-18:-8], chunk.data[-8:]
-    )
+    """
+    Parse the tag-1 song-text section.
+
+    Only the final 8 bytes are a fixed field (the timing/version trailer).
+    Everything before it is the title, an optional NUL separator, the
+    free-text message, and a variable-length run of NUL padding.
+
+    The 10-byte zero footer is real and fixed-width for Skale-emitted
+    files (PROVENANCE.md section 1). It is not sliced off separately
+    here, because reserving 10 bytes unconditionally truncates the
+    message of any file whose trailing NUL run is shorter -- true of the
+    hand-authored probe fixtures 42 and 43, whose messages previously
+    lost their final character. Taking the message up to the trailer and
+    NUL-stripping is correct for both. Observed trailing-run lengths:
+    9 (2 hand-authored), 10 (47), 11 (1), 12 (121); a run of 10 or more
+    is what the fixed footer predicts. `zero_footer_raw` still reports
+    the last 10 padding bytes.
+    """
+    # Only the 8-byte trailer is a fixed field; a well-formed section also
+    # needs at least the title's NUL terminator ahead of it. The old minimum
+    # of 18 reserved the 10-byte footer, which is no longer sliced off here.
+    if len(chunk.data) < 9:
+        raise ValueError(
+            "song text chunk is too short for a terminated title and its "
+            f"8-byte trailer (got {len(chunk.data)} bytes, need at least 9)")
+    text, trailer = chunk.data[:-8], chunk.data[-8:]
+    # Reported only when the canonical footer region actually exists.
+    zero_footer = chunk.data[-18:-8] if len(chunk.data) >= 18 else None
     initial_bpm, initial_speed, channel_count, reserved, version_raw = \
         struct.unpack("<BBBBI", trailer)
     title, nxt = cstring(text)
     separator_ok = nxt < len(text) and text[nxt] == 0
     message_raw = text[nxt + 1:] if separator_ok else text[nxt:]
     message = message_raw.rstrip(b"\x00").decode("latin-1", "replace")
+    padding_length = len(message_raw) - len(message_raw.rstrip(b"\x00"))
     return {
         "title": title.strip(),
         "message": message,
@@ -805,9 +829,11 @@ def extract_ogg_stream(raw, sample):
     stream = raw[off + 4:off + 4 + inner_len]
     if stream[:4] != b"OggS":
         raise ValueError(f"expected OggS magic, got {stream[:4]!r}")
-    if not stream.endswith(b"\xff\xff"):
-        raise ValueError("expected fixed FF FF padding after Ogg stream")
-    return stream[:-2]
+    if not stream.endswith(b"\x01\x00\xff\xff"):
+        raise ValueError(
+            "expected fixed 01 00 FF FF padding after Ogg stream, "
+            f"got {stream[-4:]!r}")
+    return stream[:-4]
 
 
 XM_C4_REFERENCE_HZ = 8363.0  # externally documented, fixed by the XM spec

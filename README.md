@@ -18,7 +18,7 @@ Skale executable was not disassembled, decompiled, or debugged.
 The container, song metadata, order list, pattern framing, channel-major event
 encoding, common instrument/sample records, PCM and embedded Ogg payloads,
 keymaps, principal envelopes, and the 0.76 global mixer section are documented.
-Some 0.76 instrument prefixes remain difficult to locate declaratively. VST2
+Instrument chunk IDs select all observed keymap/settings layouts declaratively. VST2
 FX records and the counted VSTi parameter prefix are covered by rights-safe
 fixtures; plugin-specific meanings and Skale's VSTi routing tail remain
 intentionally incomplete.
@@ -97,3 +97,17 @@ python3 reference/skmparse.py --json tests/fixtures/authentic/empty-skale-076-fi
 python3 tools/validate_public_tree.py .
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+To repeat the independent instrument-layout and generated-parser comparison:
+
+```sh
+kaitai-struct-compiler -t python --outdir /tmp/skm-generated kaitai/skm.ksy
+# Run with Python containing the official kaitaistruct 0.11 runtime.
+python tools/check_instrument_layouts.py tests/fixtures/authentic --generated-dir /tmp/skm-generated
+```
+
+The checker accepts additional file/directory arguments for a private corpus.
+Deliberate container-truncation fixtures must be tested separately as rejects.
+Known malformed Ogg payloads are counted and must fail extraction while their
+containers remain inspectable. `FORMAT.md` documents the updated Section 3
+fields and compatibility aliases; regenerated Kaitai types use the new layout.

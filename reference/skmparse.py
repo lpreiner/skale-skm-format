@@ -52,9 +52,8 @@ STILL UNDECODED
       (extract_pcm_samples/extract_ogg_stream/export_sample, --extract-samples
       CLI flag), corpus-wide exactly located/extracted, and cross-checked against an
       independent decoder (ffmpeg/ffprobe) and the known-content WAV ground
-      truth. A handful of small fields inside the header (byte at +4, u16
-      at +16, a fixed 5-byte tail after raw PCM, the 3-byte trailer) remain
-      unexplained. SKM raw PCM has no explicit Hertz field; export uses the
+      truth. The metadata byte at +4 remains unexplained. The former
+      unknown u16 and audio tails are inner chunk tag/EOF framing (2026-10-19). SKM raw PCM has no explicit Hertz field; export uses the
       verified XM-compatible relative-note/finetune conversion unless the
       caller supplies an override. Ogg is self-describing.
     * section 6's VSTi prefix (PROVENANCE.md §4) contains an
@@ -211,8 +210,16 @@ def parse_song_text(chunk):
     }
 
 
+# Section 2 pattern records are ordinary (id=1, tag=1, u32 length) chunks
+# in a chunk list closed by EOF (PROVENANCE.md §5.15). The historical
+# "signature" is just that header's id/tag half.
 PATTERN_SIG = b"\x01\x00\x01\x00"
-TRACK_SEP = b"\x01\x01"
+# Tracks inside a pattern use a half-width chunk header:
+# u8 id (=1), u8 tag (1 = track, 0xFF = end), u16 length.
+TRACK_HDR = struct.Struct("<BBH")
+TRACK_TAG = 1
+TRACK_TAG_END = 0xFF
+TRACK_SEP = b"\x01\x01"  # historical name for a track header's id/tag half
 
 # Special `note` field values, outside the normal 0..~95 pitch range.
 # NOTE_OFF verified 2026-08-05: entering Note Off via Caps (per keyb.html)
@@ -343,15 +350,19 @@ def decode_events(data, offset, length):
 
 def parse_tracks(data, start, end):
     """
-    Pattern payload is CHANNEL-MAJOR, not a flat cell stream:
+    Pattern payload is CHANNEL-MAJOR, not a flat cell stream, framed as a
+    half-width chunk list (PROVENANCE.md §5.15, 2574/2574 records exact):
 
-        track[channel_count]:
-            u16  length
+        track_chunk[]:
+            u8   id                 (always 1)
+            u8   tag                (1 = track, 0xFF = end of list)
+            u16  length             (0 for the end marker)
             u8   channel_index      (sequential 0..channel_count-1)
             u8   events[length-1]
-        separated by the literal bytes 01 01 (absent after the last track)
 
-    Verified exact on 75/75 patterns across the corpus.
+    The former "01 01 separator" and "01 ff 00 00 trailer" are these
+    headers' id/tag bytes and the end marker. `start` must point at the
+    first track header and `end` at the pattern chunk's end.
 
     `rows` is absolute-indexed, not track-local: `decode_events`'s
     on-the-wire row list is left-padded with `reserved` leading `None`s
@@ -364,10 +375,14 @@ def parse_tracks(data, start, end):
     """
     off = start
     tracks = []
-    while off + 2 <= end:
-        (ln,) = struct.unpack_from("<H", data, off)
-        off += 2
-        if ln < 1 or off + ln > end:
+    while off + TRACK_HDR.size <= end:
+        tid, ttag, ln = TRACK_HDR.unpack_from(data, off)
+        off += TRACK_HDR.size
+        if tid != 1:
+            return tracks, False
+        if ttag == TRACK_TAG_END:
+            return tracks, ln == 0 and off == end
+        if ttag != TRACK_TAG or ln < 1 or off + ln > end:
             return tracks, False
         events_offset = off + 1
         events_length = ln - 1
@@ -388,11 +403,6 @@ def parse_tracks(data, start, end):
                 and reserved + (len(decoded) - 1) == last_row),
         })
         off += ln
-        if off == end:
-            return tracks, True
-        if data[off:off + 2] != TRACK_SEP:
-            return tracks, False
-        off += 2
     return tracks, False
 
 
@@ -423,29 +433,23 @@ def parse_patterns(chunk):
                                          field exactly, not the trailing
                                          byte count.
         u8    repeat_pattern         -- Skale UI's "REPEAT PATT." order index
-        pattern_record[]  starting at offset 0x103
-        u8    tail[8]                (consistent 8-byte section trailer)
+        chunk pattern[]  starting at offset 0x103, an ordinary chunk list
+                         closed by EOF (01 00 FF FF 00 00 00 00 -- the
+                         historical "8-byte section tail")
 
-    Each pattern record:
+    Each pattern chunk (PROVENANCE.md §5.15, Verified 2026-10-19):
 
-        u32   signature  01 00 01 00
-        u16   packed_size   -- counted from this field's OWN offset
-        u16   ?             (always 0 so far)
+        u16   id = 1, u16 tag = 1, u32 length   (the historical
+              "signature 01 00 01 00 + u16 packed_size + u16 ?")
         u8    pattern_index
-        u8    rows          (stored 0 represents 256; public fixtures cover
-                             1, 64, 128, and 256 rows)
-        u8    ?             (0)
-        u8    ?             (1)
-        u8    ?             (1)
-        u8    packed_data[...]
-        u8    trailer[4]    (01 ff 00 00)
+        u16   rows          (Skale writes 256 as 00 01; the old "u8 rows,
+                             0 means 256" reading treated its high byte as
+                             an unknown constant)
+        track_chunk[]       (see `parse_tracks`), closed by 01 ff 00 00
 
-    So: next_record = size_field_offset + packed_size + 4.
-
-    The channel-major track framing and two-mode row-token grammar inside
-    packed_data are decoded by `parse_tracks` / `decode_events` with exact
-    byte consumption across the complete corpus. Remaining questions concern
-    a few field semantics, not record framing or byte consumption.
+    The channel-major track framing and two-mode row-token grammar are
+    decoded by `parse_tracks` / `decode_events` with exact byte consumption
+    across the complete corpus. No section-2 framing bytes remain unknown.
     """
     d = chunk.data
     channels = d[0]
@@ -472,22 +476,28 @@ def parse_patterns(chunk):
 
     records = []
     off = 0x103
-    clean = True
-    while off + 13 < len(d):
-        if d[off:off + 4] != PATTERN_SIG:
+    try:
+        pattern_chunks, used_bytes = read_chunks(d[off:], base=off)
+    except ValueError:
+        pattern_chunks, used_bytes = [], 0
+    clean = bool(pattern_chunks) and pattern_chunks[-1].tag == TAG_EOF \
+        and pattern_chunks[-1].id == 1 and pattern_chunks[-1].length == 0
+    for pc in pattern_chunks:
+        if pc.tag == TAG_EOF:
+            break
+        if pc.id != 1 or pc.tag != 1 or pc.length < 3:
             clean = False
             break
-        (packed_size,) = struct.unpack_from("<H", d, off + 4)
-        data_end = off + 4 + packed_size
-        tracks, tracks_clean = parse_tracks(d, off + 13, data_end)
-        # `rows` is a u8, so a 256-row pattern wraps to 0 -- confirmed real
-        # via a paired .xm export (n_rows=256) with intact, decodable row
-        # content past row 255 (PROVENANCE.md §2's 2026-08-08 update);
-        # Skale's own UI refused to grow a maxed-out pattern any further,
-        # so 256 is a hard ceiling, never a larger multiple. `rows_raw` is
-        # kept alongside for anyone who wants the literal on-disk byte.
-        rows_raw = d[off + 9]
-        rows = rows_raw or 256
+        body = pc.offset + HDR.size  # offset within section 2's payload
+        data_end = body + pc.length
+        tracks, tracks_clean = parse_tracks(d, body + 3, data_end)
+        # `rows` is a u16 (PROVENANCE.md §5.15). Every 256-row pattern
+        # Skale wrote in the corpus stores 00 01; the older "u8 rows,
+        # stored 0 means 256" model read only the low byte. Skale refuses
+        # to grow a pattern past 256 (§5.4), and 0 is unobserved in
+        # Skale output, so it is reported as-is rather than guessed.
+        rows_raw = struct.unpack_from("<H", d, body + 1)[0]
+        rows = rows_raw
         # Right-pad every track to the pattern's true row count -- trailing
         # empty rows are never encoded on the wire regardless of a
         # pattern's real length (same §2 finding), and `parse_tracks`
@@ -498,21 +508,19 @@ def parse_patterns(chunk):
             if len(tr["rows"]) < rows:
                 tr["rows"] = tr["rows"] + [None] * (rows - len(tr["rows"]))
         records.append({
-            "offset": off,
-            "index": d[off + 8],
+            "offset": pc.offset,
+            "index": d[body],
             "rows": rows,
             "rows_raw": rows_raw,
-            "packed_size": packed_size,
-            "data_offset": off + 13,
+            "length": pc.length,
+            "packed_size": pc.length,  # historical alias of the chunk length
+            "data_offset": body + 3,   # first track-chunk header
             "track_count": len(tracks),
-            "tracks_clean": tracks_clean,
+            "tracks_clean": tracks_clean and len(tracks) == channels,
             "tracks": tracks,
         })
-        nxt = off + 4 + packed_size + 4
-        if nxt + 4 > len(d):
-            off = nxt
-            break
-        off = nxt
+    off += used_bytes
+    clean = clean and off == len(d)
 
     return {
         "channel_count": channels,
@@ -565,32 +573,27 @@ LOOP_TYPES = {0: "off", 1: "forward", 2: "ping-pong"}
 SAMPLE_FORMATS = {2: "pcm16", 3: "pcm8", 4: "ogg"}
 BYTES_PER_SAMPLE = {2: 2, 3: 1}
 
-# Fixed-size header immediately after the sample name's NUL, before
-# audio_data[]. PROVENANCE.md §3.1 -- located and cross-format verified
-# 2026-08-08 against 4 authored files (raw PCM at two bit depths and Ogg,
-# each with/without the CONV. sign-flip) built from a known-content mono
-# WAV, plus corpus-wide validated with exact record-size matches: 1 +
-# len(name)+1 + 27 + audio_data_length + 3 == the sample sub-chunk's own
-# declared length, with zero exceptions across every located instrument
-# record in the corpus).
-SAMPLE_HEADER_LEN = 27
 
 
 def _sample_subchunk_size_exact(sd):
+    """Check bounded inner audio chunks and EOF framing, including empty slots.
+
+    EOF values are validated separately so malformed payload fixtures remain
+    inspectable; lengths must account for every byte.
     """
-    True if a candidate id=1/tag=1 sample sub-chunk's own bytes (`sd`)
-    satisfy the §3.1 invariant (header + audio_data + 3-byte trailer ==
-    the whole sub-chunk), False if they don't, None if too short to judge.
-    Used both to accept/reject a `locate_sample_list` candidate offset and
-    by `parse_sample_subchunk`'s reported `size_exact` field.
-    """
-    _, n2 = cstring(sd, 1)
-    hdr = sd[n2:n2 + SAMPLE_HEADER_LEN]
-    if len(hdr) < SAMPLE_HEADER_LEN:
-        return None
-    audio_data_length = struct.unpack_from("<I", hdr, 18)[0]
-    trailer_offset = n2 + SAMPLE_HEADER_LEN + audio_data_length
-    return trailer_offset + 3 == len(sd)
+    _, n = cstring(sd, 1)
+    at = n + 14
+    if at + HDR.size > len(sd):
+        return False
+    while at + HDR.size <= len(sd):
+        cid, tag, length = HDR.unpack_from(sd, at)
+        at += HDR.size
+        if at == len(sd) and length == 0:
+            return True
+        if tag != 1 or cid not in SAMPLE_FORMATS or length < 5:
+            return False
+        at += length
+    return False
 
 
 def locate_sample_list(data, start, window=SAMPLE_LIST_SEARCH_WINDOW):
@@ -607,24 +610,22 @@ def locate_sample_list(data, start, window=SAMPLE_LIST_SEARCH_WINDOW):
     region itself, which coincidentally parses as a tiny valid chunk list
     often enough to matter. Each candidate's own id=1/tag=1 sample
     sub-chunks (if any) are additionally checked against the §3.1
-    header+audio_data+trailer size invariant; a candidate with even one
+    bounded inner-audio-chunk/EOF invariant; a candidate with even one
     failing sample is rejected and the scan continues. A candidate with no
     sample sub-chunks at all (a purely param/envelope-referencing
     instrument, e.g. VSTi-only) is accepted on structural validity alone,
     since there's nothing to size-check.
 
-    Not every record has a locatable list even under this stricter,
-    permissive-start search. The remaining unlocated records in the research
-    corpus contain no `.wav`-suffixed string and are sample-less text/credit
-    slots rather than failed locations of populated audio. `kssibit.skm`,
-    once thought to use a different old layout, was resolved after removing
-    the superseded fixed search-start assumption. Returns None rather than
-    guessing.
+    Including `(2, 2)` alongside `(1, 1)`, `(3, 2)`, and `(1, TAG_EOF)` as a
+    valid leading sub-chunk locates 100% of corpus instrument records
+    (including sample-less pre-0.76 text/credit slots whose nested list begins
+    directly with `id=2, tag=2` parameter/envelope records). Returns None
+    rather than guessing if a record does not close cleanly.
     """
-    limit = min(start + window, len(data) - HDR.size)
+    limit = min(start + window, len(data) - HDR.size + 1)
     for off in range(start, limit):
         cid, tag, length = HDR.unpack_from(data, off)
-        if cid not in (1, 3) or tag not in (1, 2, TAG_EOF):
+        if (cid, tag) not in ((1, 1), (2, 2), (3, 2), (1, TAG_EOF)):
             continue
         if off + HDR.size + length > len(data):
             continue
@@ -647,10 +648,9 @@ def parse_sample_subchunk(rec):
     chunk). Field offsets are relative to the sample name's NUL, per
     PROVENANCE.md §3.1 -- volume/panning/finetune/relative_note/
     loop_start/loop_end/loop_type/format/frames/channels are Verified
-    exact (single-variable edit-and-diff tests, corpus-wide validated for
-    the fields added 2026-08-08). Still open: the unknown byte at +4, the
-    always-1 u16 at +16, the meaning of the fixed 5 extra bytes at the end
-    of a raw-PCM audio_data region, and the 3-byte trailer after it.
+    exact. The 14-byte metadata is followed by an audio chunk list and EOF.
+    The byte at +4 remains unknown. The former unknown u16 at +16 is the
+    audio chunk tag; the former five-byte tail belongs to the EOF header.
     """
     d = rec.data
     name, n2 = cstring(d, 1)
@@ -675,6 +675,7 @@ def parse_sample_subchunk(rec):
         # 127 only make musical sense as negative transposes.
         "finetune": struct.unpack_from("<b", d, n2 + 2)[0],
         "relative_note": struct.unpack_from("<b", d, n2 + 3)[0],
+        "unknown_a": d[n2 + 4],
         # Absolute sample-frame positions. A causal fixture with UI values
         # 0x529A and 0x50AC4 confirms that both are full little-endian u32s.
         "loop_start": struct.unpack_from("<I", d, n2 + 5)[0],
@@ -682,36 +683,42 @@ def parse_sample_subchunk(rec):
         "loop_type": LOOP_TYPES.get(loop_type_raw, loop_type_raw),
         "record_len": rec.length,
     }
-    hdr = d[n2:n2 + SAMPLE_HEADER_LEN]
-    if len(hdr) < SAMPLE_HEADER_LEN:
+    out["size_exact"] = _sample_subchunk_size_exact(d) is True
+    audio_header = n2 + 14
+    if audio_header + HDR.size > len(d):
         out["audio_located"] = False
         return out
-    format_raw = struct.unpack_from("<H", hdr, 14)[0]
-    audio_data_length = struct.unpack_from("<I", hdr, 18)[0]
-    stored_value_count = struct.unpack_from("<I", hdr, 22)[0]
-    channels = hdr[26]
-    audio_offset = n2 + SAMPLE_HEADER_LEN  # start of audio_data[], relative to d
+    format_raw, tag, audio_chunk_length = HDR.unpack_from(d, audio_header)
+    if tag == TAG_EOF and audio_chunk_length == 0:
+        out.update(audio_located=False, empty_slot=True)
+        return out
+    if tag != 1 or format_raw not in SAMPLE_FORMATS or audio_chunk_length < 5:
+        out["audio_located"] = False
+        return out
+    body = audio_header + HDR.size
+    audio_end = body + audio_chunk_length
+    if audio_end + HDR.size != len(d):
+        out["audio_located"] = False
+        return out
+    stored_value_count, channels = struct.unpack_from("<IB", d, body)
     out.update({
         "format": SAMPLE_FORMATS.get(format_raw, format_raw),
         "format_raw": format_raw,
-        # This on-disk field counts total interleaved sample values, not
-        # per-channel frames. Keep `frames` as a compatibility alias until
-        # downstream private tooling migrates; public consumers should use
-        # `stored_value_count` / `frame_count_per_channel`.
+        "audio_chunk_tag": tag,
+        "audio_chunk_length": audio_chunk_length,
         "stored_value_count": stored_value_count,
         "frame_count_per_channel": (
             stored_value_count // channels
             if channels and stored_value_count % channels == 0 else None
         ),
-        "frames": stored_value_count,
+        "frames": stored_value_count,  # compatibility alias
         "channels": channels,
-        "audio_data_length": audio_data_length,
-        "audio_data_offset": rec.offset + HDR.size + audio_offset,
+        # Legacy alias counts the five-byte value-count/channel prefix.
+        "audio_data_length": audio_chunk_length,
+        "audio_payload_length": audio_chunk_length - 5,
+        "audio_data_offset": rec.offset + HDR.size + body + 5,
+        "audio_eof_valid": d[audio_end:] == HDR.pack(1, TAG_EOF, 0),
         "audio_located": True,
-        # Corpus-wide invariant, PROVENANCE.md §3.1: header + audio_data
-        # + a fixed 3-byte trailer accounts for the entire sample
-        # sub-chunk with no slack bytes.
-        "size_exact": _sample_subchunk_size_exact(d) is True,
     })
     return out
 
@@ -725,7 +732,7 @@ def parse_instrument_envelope(rec):
     for malformed envelope state.
     """
     d = rec.data
-    if len(d) < 10 or d[0] != 0 or d[1] not in (1, 2) or d[2] not in (0, 1):
+    if len(d) < 9 or d[0] != 0 or d[1] not in (1, 2) or d[2] not in (0, 1):
         return None
     count = d[3]
     core_length = 9 + 4 * count
@@ -772,9 +779,8 @@ def extract_pcm_samples(raw, sample):
     a known unsigned PCM8 WAV and every one of its 44,100 stored bytes equals
     the corresponding WAV byte XOR 0x80, proving the conversion exactly.
 
-    The fixed, unexplained 5-byte tail documented in §3.1 (present
-    after every raw-PCM audio_data[], regardless of channel count) is
-    excluded -- only `frames` real sample values are read.
+    The bounded payload excludes the following EOF chunk. Only `frames`
+    real sample values are read.
 
     Raises ValueError if `sample` isn't a located raw-PCM sample, or if
     the file is too short for the declared frame count.
@@ -784,6 +790,8 @@ def extract_pcm_samples(raw, sample):
         raise ValueError(f"not a raw-PCM sample (format={sample.get('format')!r})")
     bps = BYTES_PER_SAMPLE[fmt]
     n_bytes = sample["frames"] * bps
+    if n_bytes != sample["audio_payload_length"]:
+        raise ValueError("PCM value count does not match bounded audio payload")
     off = sample["audio_data_offset"]
     data = raw[off:off + n_bytes]
     if len(data) != n_bytes:
@@ -798,42 +806,29 @@ def extract_pcm_samples(raw, sample):
 
 
 def extract_ogg_stream(raw, sample):
-    """
-    Return the raw Ogg/Vorbis stream bytes for an Ogg-format sample
-    (format 4): audio_data[] is a u32 inner length followed by an
-    "OggS"-magic Vorbis stream followed by Skale's fixed four-byte
-    `01 00 FF FF` padding (§3.1). The returned bytes omit all four
-    padding bytes and are a complete, self-contained Ogg stream -- Vorbis
-    embeds its own sample rate in the stream's identification header, so
-    (unlike raw PCM) no external rate needs to be supplied to play or
-    decode it.
+    """Extract only the Ogg stream inside its audio chunk.
 
-    The padding is four bytes, not two: 1032/1032 corpus Ogg samples and
-    3/3 public Ogg fixtures end `01 00 FF FF`. Omitting only the trailing
-    `FF FF` leaves `01 00` after the real Ogg EOS, which is enough to
-    make a push-mode Vorbis decoder consume nothing and report
-    "need more data" indefinitely (§3.1's 2026-08-25 correction).
-
-    Raises ValueError if `sample` isn't a located Ogg sample, if the
-    inner length overruns the sub-chunk's declared audio_data_length, or
-    if the stream doesn't start with the expected "OggS" magic.
+    The inner `u32` length is self-inclusive: it counts its own four bytes
+    plus the stream (PROVENANCE.md §5.15; 1032/1032 corpus streams end
+    exactly at the audio chunk's end). Older notes described this as an
+    overcount reaching into the EOF header; the bytes checked are the same.
     """
     if sample.get("format_raw") != 4:
         raise ValueError(f"not an Ogg sample (format={sample.get('format')!r})")
     off = sample["audio_data_offset"]
-    inner_len = struct.unpack_from("<I", raw, off)[0]
-    if 4 + inner_len > sample["audio_data_length"]:
-        raise ValueError(
-            f"inner Ogg length {inner_len} overruns audio_data_length "
-            f"{sample['audio_data_length']}")
-    stream = raw[off + 4:off + 4 + inner_len]
+    length = sample["audio_payload_length"]
+    payload = raw[off:off + length]
+    if len(payload) != length or length < 4:
+        raise ValueError("truncated Ogg payload")
+    inner_len = struct.unpack_from("<I", payload)[0]
+    if inner_len != length:
+        raise ValueError("self-inclusive inner Ogg length does not match the bounded payload")
+    if not sample.get("audio_eof_valid"):
+        raise ValueError("invalid audio EOF header (formerly Ogg padding)")
+    stream = payload[4:]
     if stream[:4] != b"OggS":
         raise ValueError(f"expected OggS magic, got {stream[:4]!r}")
-    if not stream.endswith(b"\x01\x00\xff\xff"):
-        raise ValueError(
-            "expected fixed 01 00 FF FF padding after Ogg stream, "
-            f"got {stream[-4:]!r}")
-    return stream[:-4]
+    return stream
 
 
 XM_C4_REFERENCE_HZ = 8363.0  # externally documented, fixed by the XM spec
@@ -884,110 +879,131 @@ def export_sample(raw, sample, out_path, sample_rate=None):
         w.writeframes(frames)
 
 
-def parse_mixer_strip(data, sample_list_start, prefix_len):
-    """0.76's per-instrument mixer channel strip, immediately before the
-    sample sub-chunk list. See PROVENANCE.md §3.3 -- offsets are
-    relative to `sample_list_start` (already located structurally by
-    locate_sample_list), not a fixed absolute position. Verified via
-    causal Wine-GUI tests for toggle01/volume_fader/bal/sub_assign[1]/
-    sub_assign[3]/eq bands L&H's shape; sub_assign[0]/[2] and eq bands
-    L/M's exact fields are positional only (not independently tested).
-    The original complete mapping applies to the framed-keymap layouts. Safe
-    public single-variable probes additionally verify that the alternate
-    direct-keymap 412-byte prefix stores volume_fader at list_start-275 and
-    bal at list_start-271 (four bytes later); only those causally established
-    fields are exposed for that layout.
+def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
+    """Decode the three-band strip from the versioned post-keymap block.
 
-    Returns None if the framed region doesn't look sane (boolean-shaped bytes
-    not in {0,1}) -- confirmed (PROVENANCE.md §3.3) to happen on a
-    handful of real 0.76 records that carry an older, smaller 2-band-EQ
-    layout rather than this one, despite matching version_raw; not a
-    locate_sample_list mis-location (sample_list_start itself checks out
-    fine on those records).
+    IDs 4/5 have a 284-byte block; ID 6 adds BGR color and a pad.
+    ID 3's older 401-byte settings block is kept raw.
     """
-    s = sample_list_start
-
+    if record_version not in (4, 5, 6):
+        return None
+    base = sample_list_start - (288 if record_version == 6 else 284)
     def flag(off):
-        return data[s + off]
-
+        return data[base + off]
     def f32(off):
-        return struct.unpack_from("<f", data, s + off)[0]
-
+        return struct.unpack_from("<f", data, base + off)[0]
     def eq_band(off):
-        return {
-            "enabled_flag": flag(off),
-            "gain": f32(off + 1),
-            "freq": f32(off + 5),
-        }
-
-    if prefix_len == 412:
-        volume_fader = f32(-275)
-        bal = f32(-271)
-        if (not math.isfinite(volume_fader) or volume_fader < 0.0
-                or not math.isfinite(bal) or not -0.5 <= bal <= 0.5):
-            return None
-        return {
-            "layout": "direct-412",
-            "volume_fader": volume_fader,
-            "bal": bal,
-        }
-
-    flags = [flag(-281), flag(-136)] + [flag(o) for o in (-35, -34, -33, -32)]
-    flags += [eq_band(o)["enabled_flag"] for o in (-31, -22, -13)]
+        return {"enabled_flag": flag(off), "gain": f32(off + 1),
+                "freq": f32(off + 5)}
+    flags = [flag(7)] + [flag(o) for o in range(253, 257)]
+    flags += [flag(o) for o in (257, 266, 275)]
     if any(v not in (0, 1) for v in flags):
         return None
+    volume, bal = f32(9), f32(13)
+    if not math.isfinite(volume) or volume < 0 or not math.isfinite(bal) or not -0.5 <= bal <= 0.5:
+        return None
+    out = {
+        "layout": "direct-412" if record_version == 4 else "framed",
+        "toggle01": flag(7),
+        # Preserve the historical name, but this is not universally boolean:
+        # VANGard instrument 1 stores 12 at this offset.
+        "toggle01_companion": flag(152),
+        "volume_fader": volume, "bal": bal,
+        "sub_assign": [flag(o) for o in range(253, 257)],
+        "eq_l": eq_band(257), "eq_m": eq_band(266), "eq_h": eq_band(275),
+    }
+    if record_version == 6:
+        out["color_bgr"] = list(data[base + 284:base + 287])
+        out["color_pad"] = flag(287)
+    return out
 
+
+def parse_settings_block(settings, record_version):
+    """Decode structure shared by the versioned post-keymap settings blocks.
+
+    The first 130 bytes are common to IDs 3-6 (PROVENANCE.md §5.15). The 16
+    send knobs are 13-byte records in ID 3 (flag, f32 value, f32 0.0,
+    f32 1.0) and 6-byte records in IDs 4-6 (flag, f32 value, u8 index);
+    flag/value agree 1392/1392 across a 0.75 file and its 0.81 resave.
+    Fields whose UI meaning is not established are named by offset only.
+    """
+    f32 = lambda off: struct.unpack_from("<f", settings, off)[0]
+    if record_version == 3:
+        knobs = [{"flag": settings[o], "value": f32(o + 1),
+                  "aux": (f32(o + 5), f32(o + 9))}
+                 for o in range(139, 139 + 16 * 13, 13)]
+    else:
+        knobs = [{"flag": settings[o], "value": f32(o + 1),
+                  "index": settings[o + 5]}
+                 for o in range(156, 156 + 16 * 6, 6)]
     return {
-        "layout": "framed",
-        "toggle01": flag(-281),
-        "toggle01_companion": flag(-136),
-        "volume_fader": f32(-279),
-        "bal": f32(-275),
-        "sub_assign": [flag(o) for o in (-35, -34, -33, -32)],
-        "eq_l": eq_band(-31),
-        "eq_m": eq_band(-22),
-        "eq_h": eq_band(-13),
+        "send_knobs": knobs,
+        # Identity (entry i == i) in 1777/1793 corpus records; the only
+        # deviations remap entry 7 to 16 or 17. Meaning unidentified.
+        "table_25": list(settings[25:89]),
+        # Probable instrument-filter block (Conjecture): defaults
+        # 5000/5000/50/0.5/0.5/0/10, edited values in steps of 1/42.
+        "unidentified": {
+            "u8_89": settings[89], "f32_90": f32(90), "f32_94": f32(94),
+            "u8_98": settings[98], "f32_102": f32(102), "f32_106": f32(106),
+            "f32_110": f32(110), "f32_114": f32(114), "f32_118": f32(118),
+            "u8_122": settings[122], "u8_126": settings[126],
+            "u8_127": settings[127],
+        },
     }
 
 
-def parse_instruments(chunk, version_raw=None):
+def instrument_prefix(data, name_end, record_version):
+    """Return (128 local slots, keymap end, nested-list start, entries), or None.
+
+    Chunk ID selects direct versus variable-length framed entries. Unknown
+    record versions are preserved by the caller rather than guessed.
+
+    A framed entry is read as `u8 flag, u8 layer_count, layer[layer_count]`
+    with 4-byte layers (PROVENANCE.md §5.15). Every observed entry is either
+    `00 00` (unmapped) or `01 01 <slot> 00 7F 00` (one layer); that the
+    second byte is a count and the 00/7F pair a range is Conjecture, so
+    other layer bytes are preserved raw rather than rejected. Unmapped
+    entries are reported as slot 0 in the compatibility list and as
+    `None` in `entries`.
     """
-    Section 3 holds one nested chunk per instrument:
+    if record_version not in (3, 4, 5, 6):
+        return None
+    pos = name_end
+    slots = []
+    entries = None
+    if record_version in (3, 4):
+        if pos + 128 > len(data):
+            raise ValueError("truncated direct keymap")
+        slots = list(data[pos:pos + 128])
+        pos += 128
+    else:
+        entries = []
+        for _ in range(128):
+            if pos + 2 > len(data):
+                raise ValueError("truncated framed keymap entry")
+            flag, count = data[pos], data[pos + 1]
+            if flag not in (0, 1) or (flag == 1) != (count > 0):
+                raise ValueError("invalid framed keymap entry header")
+            end = pos + 2 + 4 * count
+            if end > len(data):
+                raise ValueError("truncated framed keymap entry")
+            layers = [tuple(data[at:at + 4]) for at in range(pos + 2, end, 4)]
+            entries.append(layers or None)
+            slots.append(layers[0][0] if layers else 0)
+            pos = end
+    start = pos + {3: 401, 4: 284, 5: 284, 6: 288}[record_version]
+    if start + HDR.size > len(data):
+        raise ValueError("truncated instrument settings or nested list")
+    return slots, pos, start, entries
 
-        u8    index
-        cstr  name                 -- first/primary sample's name, or the
-                                       instrument's own name for a
-                                       sample-less (e.g. VSTi) instrument
-        ...                        -- keymap + envelope-shaped region. Layout
-                                       is structural, not version-only:
-                                       verified 7600-stamped files include
-                                       both direct 96-byte and framed
-                                       96x6-byte keymaps -- see
-                                       locate_sample_list.
-        nested_chunk[]              -- sample sub-chunks (id=1/tag=1) +
-                                       param_table/envelope entries
-                                       (id=3/tag=2, undecoded here),
-                                       terminated by EOF
 
-    See PROVENANCE.md §3. Only the outer shell (index/name/
-    length) is Verified for every instrument in the corpus; the internals
-    below that are best-effort and explicitly flagged per-record as
-    located or not, rather than assumed. `locate_sample_list` is searched
-    from right after the name with no envelope/keymap-size assumption
-    (dropped 2026-08-08, §3 -- the size differs by version and isn't
-    needed: the search's own structural + §3.1 size-invariant
-    validation is enough to find the real list without knowing it).
+def parse_instruments(chunk, version_raw=None):
+    """Decode Section 3 using the instrument chunk ID as record version.
 
-    On 0.76 records, immediately before the sample list sits the
-    per-instrument mixer channel strip (volume/BAL/EQ/toggles/SUB-assign)
-    -- see `parse_mixer_strip` and PROVENANCE.md §3.3. Exposed as
-    `mixer_strip` when `internals_located` and the region passes a sanity
-    check; `None` on pre-0.76 records, and on a handful of real 0.76
-    records confirmed (2026-08-09, §3.3's correction) to genuinely
-    carry an older, smaller 2-band-EQ layout despite reporting the same
-    version_raw -- not a locate_sample_list bug (sample_list_start is
-    correct for these; verified against the sample sub-chunk's own
-    byte-exact size check).
+    Known layouts consume 128 keymap entries and a versioned settings block.
+    Unknown IDs retain the bounded structural-search fallback, explicitly
+    marked as such; they do not acquire guessed keymap or mixer fields.
     """
     records, consumed = read_chunks(chunk.data, base=chunk.offset + HDR.size)
     out = []
@@ -1003,62 +1019,49 @@ def parse_instruments(chunk, version_raw=None):
             "record_offset": rec.offset,
         }
         if nxt < len(rec.data):
-            start = locate_sample_list(rec.data, nxt, window=len(rec.data))
+            prefix = instrument_prefix(rec.data, nxt, rec.id)
+            start = prefix[2] if prefix else locate_sample_list(
+                rec.data, nxt, window=len(rec.data))
+            entry["record_version"] = rec.id
+            entry["prefix_source"] = "record-version" if prefix else "structural-search"
+            if start is not None:
+                nested, used = read_chunks(rec.data[start:])
+                if (used != len(rec.data) - start or not nested
+                        or nested[-1].tag != TAG_EOF
+                        or any(_sample_subchunk_size_exact(sc.data) is False
+                               for sc in nested if sc.id == 1 and sc.tag == 1)):
+                    raise ValueError("invalid instrument nested list")
             entry["internals_located"] = start is not None
             if start is not None:
-                # Canonical 0.76 layout only. Fixtures 09/10 isolate the
-                # little-endian fadeout value at keymap_end + 64, and every
-                # paired XM using this 928-byte prefix agrees. Other observed
-                # prefix sizes are deliberately left undecoded.
-                if version_raw == 7600 and start - nxt == 928:
-                    entry["fadeout"] = struct.unpack_from("<H", rec.data,
-                                                           nxt + 640)[0]
                 prefix_len = start - nxt
-                # Canonical later 0.76 instruments begin with 96 six-byte
-                # keymap entries immediately after the name. Accept only the
-                # exact verified framing.
-                if start - nxt >= 96 * 6:
-                    entries = [rec.data[nxt + 6 * i:nxt + 6 * (i + 1)]
-                               for i in range(96)]
-                    if all(e[:2] == b"\x01\x01"
-                           and e[3:] == b"\x00\x7f\x00"
-                           for e in entries):
-                        entry["keymap"] = [e[2] for e in entries]
-                        entry["keymap_layout"] = "framed-6-byte"
-                        # Native single-variable Cut/Note Off pairs verify the
-                        # field independently in all three framed prefixes.
-                        framed_note_death_offsets = {
-                            1048: 772,
-                            1052: 776,
-                            1056: 776,
-                        }
-                        if prefix_len in framed_note_death_offsets:
-                            note_death_raw = rec.data[
-                                nxt + framed_note_death_offsets[prefix_len]]
-                            entry["note_death_raw"] = note_death_raw
-                            entry["note_death"] = {
-                                0: "cut", 1: "note-off"
-                            }.get(note_death_raw, "unknown")
-                elif ((version_raw is not None and version_raw < 7600
-                       and prefix_len == 529)
-                      or (version_raw == 7600 and prefix_len == 412)):
-                    # 0.70/0.71/0.75 use one direct local-slot byte per
-                    # note in the fixed 529-byte prefix. A controlled public
-                    # Skale 0.76 fixture proves that the alternate 412-byte
-                    # 0.76 prefix uses the same direct 96-byte map even though
-                    # the file header is 0.76; layout therefore cannot be
-                    # selected from version_raw alone.
-                    entry["keymap"] = list(rec.data[nxt:nxt + 96])
-                    entry["keymap_layout"] = "direct-96-byte"
-                    if version_raw == 7600 and prefix_len == 412:
-                        note_death_raw = rec.data[nxt + 136]
-                        entry["note_death_raw"] = note_death_raw
-                        entry["note_death"] = {
-                            0: "cut", 1: "note-off"
-                        }.get(note_death_raw, "unknown")
-                if start >= 281:
+                if prefix:
+                    slots, keymap_end, _, framed = prefix
+                    entry["keymap"] = slots[:96]  # playable-note compatibility view
+                    entry["keymap_all_slots"] = slots
+                    if framed is not None:
+                        # Distinguishes `00 00` (unmapped) from an explicit
+                        # mapping to local slot 0, which both read as 0 above.
+                        entry["keymap_mapped"] = [e is not None for e in framed]
+                        nonstandard = [
+                            (note, e) for note, e in enumerate(framed)
+                            if e is not None and (len(e) != 1 or e[0][1:] != (0, 0x7F, 0))]
+                        if nonstandard:
+                            entry["keymap_nonstandard_entries"] = nonstandard
+                    entry["keymap_layout"] = ("direct-96-byte" if rec.id in (3, 4)
+                                               else "framed-6-byte")
+                    entry["keymap_end"] = rec.offset + HDR.size + keymap_end
+                    entry["prefix_length"] = prefix_len
+                    entry["post_keymap_length"] = start - keymap_end
+                    entry["settings_raw"] = rec.data[keymap_end:start]
+                    entry["settings"] = parse_settings_block(
+                        entry["settings_raw"], rec.id)
+                    entry["mute_toggle_raw"] = rec.data[keymap_end + 6]
+                    entry["fadeout"] = struct.unpack_from("<H", rec.data, keymap_end)[0]
+                    note_death = rec.data[keymap_end + 8]
+                    entry["note_death_raw"] = note_death
+                    entry["note_death"] = {0: "cut", 1: "note-off"}.get(note_death, "unknown")
                     entry["mixer_strip"] = parse_mixer_strip(
-                        rec.data, start, prefix_len)
+                        rec.data, start, prefix_len, rec.id)
                 sub, _ = read_chunks(rec.data[start:],
                                       base=rec.offset + HDR.size + start)
                 samples = []
@@ -1498,6 +1501,8 @@ def verify_corpus(root):
     fx_slots_total = fx_slots_exact = 0
     s6_entries_total = s6_entries_in_range = 0
     tracks_total = tracks_clean = 0
+    pattern_sections_total = pattern_sections_exact = 0
+    patterns_total = patterns_rows_nonzero = 0
     tracks_row_offset_consistent = 0
     row_overflow = []
     instruments_total = instruments_located = 0
@@ -1548,7 +1553,18 @@ def verify_corpus(root):
             if all(0.0 <= p <= 1.0 for p in e["plugin_params"]):
                 s6_entries_in_range += 1
 
+        if p:
+            pattern_sections_total += 1
+            if p.get("walk_clean") and p.get("all_tracks_clean") is not False:
+                pattern_sections_exact += 1
+            else:
+                hard_failures.append((f, "section-2 chunk list or track framing not exact"))
         for r in p.get("patterns", []):
+            patterns_total += 1
+            if r.get("rows"):
+                patterns_rows_nonzero += 1
+            else:
+                hard_failures.append((f, f"pattern {r.get('index')} has u16 rows == 0"))
             for tr in r.get("tracks", []):
                 tracks_total += 1
                 if tr.get("events_clean"):
@@ -1655,6 +1671,11 @@ def verify_corpus(root):
           f"<- counted prefixes recognized; [0,1] range is informational "
           f"and plugin-specific")
     print()
+    print(f"  pattern chunk lists exact : {pct(pattern_sections_exact, pattern_sections_total)}  "
+          f"<- must be 100% (§5.15): pattern chunks + track mini-chunks + EOF, "
+          f"one track per channel")
+    print(f"  pattern rows (u16) > 0    : {pct(patterns_rows_nonzero, patterns_total)}  "
+          f"<- must be 100% (§5.15): Skale writes 256 rows as 00 01")
     print(f"  pattern tracks exact      : {pct(tracks_clean, tracks_total)}  "
           f"<- must be 100% (§6, Verified 2026-08-08)")
     print(f"  reserved/last_row consist.: {pct(tracks_row_offset_consistent, tracks_total)}  "
@@ -1667,13 +1688,9 @@ def verify_corpus(root):
         for f, idx, ch in row_overflow[:10]:
             print(f"      {f}: pattern {idx} channel {ch}")
     print(f"  instrument internals loc. : {pct(instruments_located, instruments_total)}  "
-          f"<- coverage statistic, not a hard invariant; observed unlocated "
-          f"records are sample-less text/credit slots (§3)")
+          f"<- record-version layouts include sample-less text/credit slots")
     print(f"  mixer_strip sane (0.76)   : {pct(mixer_strip_sane, mixer_strip_total)}  "
-          f"<- soft coverage statistic (§3.3); residual records carry "
-          f"an older, smaller 2-band-EQ layout despite matching "
-          f"version_raw, confirmed 2026-08-09, not a locate_sample_list "
-          f"mis-location or a flaw in this section's field layout")
+          f"<- versioned 284/288-byte strips; unknown fields remain raw")
     print(f"  sample header+audio exact : {pct(samples_size_exact, samples_total)}  "
           f"<- must be 100% where located (§3.1, Verified 2026-08-08)")
     print(f"  sample audio extracted    : {pct(samples_extract_ok, samples_extract_total)}  "

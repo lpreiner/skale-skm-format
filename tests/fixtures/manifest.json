@@ -2,7 +2,7 @@
   "schema_version": 1,
   "license": "CC0-1.0",
   "rights_affirmation": "CC0-AFFIRMATION.md",
-  "file_count": 92,
+  "file_count": 94,
   "files": [
     {
       "id": "audio:keymap-high",
@@ -742,7 +742,7 @@
       "kind": "synthetic-template-rewrite",
       "source_rights_declaration_id": "empty-skale-seeds-2026-08-14",
       "bytes": 903,
-      "sha256": "7cf88857633dbedab0f2ae2ed3870b04c62063b7e074ca76fccca730fdcf3244",
+      "sha256": "f4d1b86294250a47df86d3fdd197cf0542d93f9bfb5cfa8c517a3c9054ead93a",
       "expected_parse": "success",
       "path": "tests/fixtures/generated/empty-pattern-256-rows.skm",
       "license": "CC0-1.0"

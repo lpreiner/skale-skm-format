@@ -94,15 +94,31 @@ Pattern IDs are identities, not dense array positions. Deleted patterns may
 leave gaps. An order may reference a missing ID; observed Skale behavior is to
 present a synthetic empty 64-row pattern for it.
 
-### Pattern record
+### Pattern records
 
-Each record begins with signature `01 00 01 00`, followed by a `u16` packed
-size counted from the size field itself, two unknown zero bytes, pattern ID,
-row-count byte, the observed bytes `(0, 1, 1)`, packed track data, and trailer
-`01 FF 00 00`.
+From offset `0x103` the section is an ordinary chunk list closed by the
+standard EOF chunk. Each pattern is a chunk with `id = 1`, `tag = 1`, and a
+`u32` length. Older descriptions called its header a signature `01 00 01 00`
+plus a `u16` size and two zero bytes; those zero bytes are the length's high
+half. The payload is:
 
-The row count is a `u8`; stored zero represents 256 rows. Skale refuses to
-expand a pattern beyond 256.
+| Field | Type | Meaning |
+|---|---:|---|
+| `pattern_index` | `u8` | Pattern ID. |
+| `rows` | `u16` | Row count, 1..256. |
+| tracks | track chunks | One per channel, then an end marker. |
+
+`rows` is a `u16`. Skale writes a 256-row pattern as `00 01`. An earlier
+reading treated it as a `u8` in which 0 meant 256, and the byte after it as a
+constant. Skale refuses to expand a pattern beyond 256 rows. A stored 0 is not
+produced by Skale; its behavior is untested.
+
+Tracks use a half-width chunk header: `u8 id` (1), `u8 tag`, and a `u16`
+length. Tag 1 is a track whose payload is `u8 channel_index` followed by its
+events. Tag `0xFF` with length 0 ends the list. The bytes formerly described
+as `(0, 1, 1)` are the row count's high byte plus the first track header.
+The `01 01` separators and the `01 FF 00 00` trailer are track headers and
+the end marker.
 
 ### Track and event encoding
 
@@ -129,39 +145,45 @@ application-side check independent of the research parser.
 
 ## Section 3: instruments and samples — partial
 
-The outer nested chunk list and explicit instrument record IDs are Verified.
-Pre-0.76 instrument internals have stable version-dependent framing. Version
-0.76 has several observed envelope/keymap-to-sample-list gap sizes without a
-known discriminant; bounded structural validation is required before treating
-a candidate location as a sample list.
+The instrument chunk ID is its record version, independent of the file's
+`version_raw`. Known IDs select a 128-entry keymap followed by a fixed settings
+block and the nested sample/envelope list:
 
-A deliberately constructed prefix can wrap the genuine nested list in an
-additional structurally valid chunk, making two candidate starts satisfy all
-currently verified invariants. Such a file cannot yet be disambiguated safely;
-doing so requires decoding enough of the remaining instrument-prefix records to
-validate their identities and sizes. Malformed sample-bearing decoys are
-rejected using the verified sample-size invariant.
+| Record ID | Observed writer | Keymap bytes | Settings bytes | Total prefix |
+| --- | --- | ---: | ---: | ---: |
+| 3 | 0.70/0.71/0.75 | 128 direct | 401 | 529 |
+| 4 | 0.76 | 128 direct | 284 | 412 |
+| 5 | 0.80/0.802 | 128 framed entries | 284 | 1048/1052 observed |
+| 6 | 0.81 | 128 framed entries | 288 | 544/716/784/928/1056 observed |
 
-Keymap selection is not determined by the file version alone. Controlled CC0
-fixtures establish these layouts:
+Direct entries are one local sample-slot byte each. A framed entry is either
+`00 00` (unmapped) or `01 01 <slot> 00 7F 00` (mapped). Thus a framed map
+occupies `256 + 4*k` bytes for `k` mapped entries. The first 96 entries map
+playable notes; the remaining 32 serialized entries must also be consumed,
+without assuming their musical meaning. This explains the formerly opaque
+prefix sizes without searching or selecting from the shared `7600` file stamp.
+The Kaitai spec now decodes all four observed record versions declaratively.
 
-| File/application case | Prefix before nested sample list | Keymap |
-| --- | ---: | --- |
-| Format 0.75 | 529 bytes | 96 direct local-slot bytes |
-| Format 0.76 written by Skale 0.76 | 412 bytes | 96 direct local-slot bytes |
-| Format 0.76 written by Skale 0.80 | 1048 bytes | 96 entries of 6 bytes each |
-| Format 0.76 written by Skale 0.802 | 1052 bytes | 96 entries of 6 bytes each |
-| Format 0.76 written by Skale 0.81 | 1056 bytes | 96 entries of 6 bytes each |
+An unmapped entry (`00 00`) is distinct on disk from an explicit mapping to
+local slot 0, although both yield slot 0 in a slot list. The reference parser
+reports the distinction as `keymap_mapped`. The authentic 0.80 fixture leaves
+entry 127 unmapped, which accounts for its 1048-byte prefix against 0.802's
+1052; IDs 5 and 6 differ only by the four settings bytes.
 
-In the framed layout each verified entry is `01 01 <slot> 00 7F 00`. The two
-principal layouts have the same header version and identical logical maps,
-and the framed form is established by application version 0.80. This proves
-that consumers must use validated instrument framing rather than
-`version_raw` alone. The Kaitai specification deliberately leaves 0.76
-instrument remainders opaque until a declarative discriminator for the known
-prefix variants is established. Controlled 0.80, 0.802, and 0.81 fixtures
-further show a four-byte prefix increase at each release (1048, 1052, and
-1056 bytes respectively) while retaining byte-identical nested sample lists.
+The entry bytes fit `u8 flag, u8 layer_count, layer[layer_count]` with 4-byte
+`(slot, 00, 7F, 00)` layers. Reading the second byte as a count is a
+conjecture; no file has a count other than 0 or 1. Parsers should reject an
+inconsistent flag/count header but preserve unexpected layer bytes.
+
+The reference parser preserves its 96-note `keymap` view and adds
+`keymap_all_slots`, `record_version`, `prefix_length`, and `post_keymap_length`.
+Unknown IDs retain an explicitly marked structural-search fallback in Python;
+Kaitai preserves their remainder as raw bytes. Known malformed layouts are
+rejected rather than scanned for an alternative start. The fallback alone
+cannot resolve intentionally constructed ambiguous nested-list decoys.
+
+Sample-less ID 3/4 instruments can start their nested list with `(id=2, tag=2)`
+parameter/envelope chunks. ID 5/6 use `(id=3, tag=2)`. Both families are supported.
 
 In a backward-compatibility test, Skale 0.76 loads its own controlled keymap
 fixture without a warning but reports “NEW Chunks Found” for each controlled
@@ -181,35 +203,35 @@ does not load the 0.81 instrument or its samples. Skale 0.802 likewise reports
 content is unknown to both earlier framed-layout readers; after dismissal,
 0.802 also discards the instrument and samples.
 
-Known structures include principal volume and panning envelopes, fadeout in
-the canonical 0.76 layout, keymaps, mixer-strip fields, and nested sample
-records. Some optional instrument-editor and filter/MIDI fields remain unknown.
+Known structures include principal envelopes, keymaps, and common settings.
+Relative to the end of all 128 keymap entries, fadeout is `u16` at `+0`,
+`mute_toggle` is at `+6`, `toggle01` at `+7`, Note Death at `+8`, and the
+volume/BAL floats at `+9/+13`. Note Death `0` means Cut and `1` means Note Off;
+controlled single-variable saves establish this for writers 0.76–0.81.
+It is independent of pattern note-value encoding.
 
-For the verified 1056-byte Skale 0.81 prefix, the instrument-level Note Death
-field is one byte at keymap end + 200 (`name_end + 776`): `0` means Cut and `1`
-means Note Off. Controlled saves differing only in that UI choice change
-exactly this byte. This field controls instrument behavior and is independent
-of the pattern note-value encoding. Its position is not generalized to the
-1048- or 1052-byte prefixes.
+IDs 4/5 share a 284-byte settings block. SUB assignments occupy `+253..256`
+and three nine-byte EQ records (enabled byte, gain float, frequency float)
+start at `+257`, `+266`, and `+275`. ID 6 adds three BGR color bytes and one
+pad at `+284..287`. Earlier reports of a two-band EQ were caused by reading
+these fields four bytes out of alignment.
 
-The compact 412-byte Skale 0.76 prefix stores the same `0`/`1` field at direct
-keymap end + 40 (`name_end + 136`), or 276 bytes before its sample list.
-Controlled Cut/Note Off saves again differ by exactly that byte. The differing
-positions reinforce that the field must be selected by verified structure,
-not by the shared `7600` header.
+The first 130 settings bytes are shared by IDs 3–6. After the fields above,
+`+25..88` is a 64-byte table that is the identity map in nearly every record,
+and `+89..127` holds flags and floats. These are probably the instrument
+filter (defaults 5000, 5000, 50, 0.5, 0.5, 0, 10; a 3-bit mask at `+122`), but
+no UI control has been tied to them yet.
 
-Native single-variable pairs complete the framed-layout mapping:
-
-| Writer/prefix | Note Death field position |
-| --- | ---: |
-| Skale 0.80 / 1048 bytes | `name_end + 772` = sample list − 276 |
-| Skale 0.802 / 1052 bytes | `name_end + 776` = sample list − 276 |
-| Skale 0.81 / 1056 bytes | `name_end + 776` = sample list − 280 |
-
-Every Cut base stores `0`; every Note Off save stores `1` and differs from its
-base by that byte alone. The 0.81 four-byte addition is after Note Death but
-before the nested sample list, explaining why 0.802 and 0.81 share the absolute
-field position while their tail-relative positions differ.
+Each block ends its common part with 16 FX-send knob records. IDs 4–6 store
+them at `+156` as 6 bytes each (`u8 flag, f32 value, u8 index`). ID 3 stores
+them at `+139` as 13 bytes each (`u8 flag, f32 value, f32 0.0, f32 1.0`). ID 3
+also has a mostly-zero 54-byte tail. Knob 0 is the mixer's first send knob;
+knobs 8–15 have no visible control. The historical `toggle01_companion` at
+`+152` is preserved as a raw value: it is not universally boolean. The
+remaining constant bytes (`+132..147` all `0xFF`, `0x7F` at `+155`) are
+unidentified.
+Structural correspondence across layouts does not independently establish
+UI semantics for every field; controlled evidence is distinguished in provenance.
 
 ### Sample metadata and payload — Verified
 
@@ -230,20 +252,41 @@ PCM payloads may be signed 8-bit or signed little-endian 16-bit. The sample
 rate is represented through XM-compatible relative-note/finetune semantics
 rather than an explicit Hertz field.
 
-Embedded Ogg Vorbis is stored as a self-contained stream: a `u32` inner length,
-then an `OggS`-magic Vorbis stream, then **four** fixed padding bytes
-`01 00 FF FF`. The padding is counted inside the stored inner length. Every
-observed stream ends this way — 1032/1032 corpus Ogg samples and 3/3 public Ogg
-fixtures.
+After `u8 local_slot` and a NUL-terminated name, each sample slot has 14
+metadata bytes (volume through loop type), followed by an inner chunk list.
+An empty slot contains only EOF `(id=1, tag=0xFFFF, length=0)`. A populated
+slot contains an audio chunk `(id=format, tag=1, length=N)` and then EOF.
+The format IDs are 2 (PCM16), 3 (PCM8), and 4 (Ogg). Its payload begins with
+`u32 stored_value_count` and `u8 channels`, followed by `N-5` audio bytes.
+All boundaries must close exactly without slack.
 
-A consumer must validate the framing and exclude **all four** padding bytes
-before handing the stream to a decoder. Excluding only the trailing `FF FF`
-leaves `01 00` after the real Ogg EOS. That is enough to make a push-mode
-Vorbis decoder consume nothing and return "need more data" without changing
-state — a caller that loops while bytes remain will then spin forever, with the
-audio already fully decoded. The padding is not part of the Vorbis stream and
-carries no audio, so excluding all four bytes is lossless: decoded sample counts
-are identical either way.
+This corrects the older 27-byte-header/three-byte-trailer interpretation.
+The former unknown `u16` at metadata offset 16 is the audio chunk tag.
+The apparent five-byte PCM tail and three-byte record trailer together are
+the eight-byte EOF header. There is no extra PCM padding.
+
+For Ogg, the bounded audio bytes contain a `u32 inner_length` followed by the
+self-contained `OggS` stream. The inner length is self-inclusive: it counts
+its own four bytes plus the stream, which ends exactly where the audio chunk
+ends. Validate `inner_length == bounded_audio_length` (including the length
+word), a valid following EOF header, and Ogg magic. Pass only the bytes after
+the length word and before EOF to a decoder. Older documentation described
+the length as overcounting into four bytes of "Ogg padding", which are
+actually the EOF header. Including even two of them can stall a push-mode
+decoder.
+
+For Ogg, `stored_value_count` equals the final page's granule position times
+the channel count, as it does for PCM's interleaved values. Consumers can use
+this as a cross-check.
+
+Python exposes `audio_chunk_length` and `audio_payload_length`; the latter
+counts audio bytes after the five-byte count/channel prefix. The historical
+`audio_data_length` remains an alias for the complete inner chunk length,
+not the length of a slice starting at `audio_data_offset`. `audio_eof_valid`
+reports terminal header validity. Container inspection keeps deliberately
+bad EOF values visible; stream extraction rejects them. Kaitai likewise
+bounds its lazy Ogg view by the enclosing chunk and leaves payload-value
+validation to the consumer.
 
 ## Section 4: FX chain — Verified for the observed VST2 layout
 
@@ -301,8 +344,11 @@ A robust consumer should at minimum:
 - Non-ASCII text encoding.
 - Meaning of the second byte in non-plain volume-column forms.
 - Note value `0x80` and several Skale-native effects.
-- Two small pattern-record fields and the eight-byte section-2 tail.
-- General discriminant for all 0.76 instrument prefix/gap shapes.
-- Several sample-header/trailer fields.
-- Instrument filter and extended MIDI/remapping state.
+- The sample metadata byte at offset 4 (8 or 16; tracks bit depth only in older files).
+- UI meaning of the probable filter fields, the 64-byte table, and the
+  constant settings bytes.
+- Whether framed keymap entries can hold more than one layer.
+- How Skale loads a stored pattern row count of `0` (never written by Skale).
+- Whether Skale plays anything for an unmapped framed keymap entry.
+- Extended MIDI/remapping state.
 - Internal layout of the Skale-owned routing/send tail in section 6.

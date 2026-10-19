@@ -4,6 +4,25 @@
 
 ## Unreleased — initial public repository
 
+- Read section 2 as chunk lists: pattern chunks, half-width track chunks, and
+  their end markers account for every former unknown/separator/trailer byte.
+  The pattern row count is a `u16` (Skale writes 256 as `00 01`); the
+  synthetic 256-row fixture was regenerated to match.
+- Framed keymap entries are parsed as flag + layer count + layers. Unexpected
+  layer bytes are preserved rather than failing the file, and `keymap_mapped`
+  separates unmapped entries from explicit slot-0 mappings.
+- Decoded the 16 send-knob records for every instrument record version, and
+  mapped the rest of the settings blocks structurally.
+- Described the Ogg inner length as self-inclusive (no change to validation).
+- Resolved instrument chunk IDs as record versions; decode 128 direct or
+  variable-length keymap entries and versioned settings blocks in Python and
+  Kaitai. Added sample-less instrument support and regression coverage for all
+  observed prefix lengths; known malformed keymaps no longer trigger scanning.
+- Corrected sample framing to 14 metadata bytes plus an inner audio chunk list
+  and EOF. The former Ogg padding is part of EOF; stream extraction stays inside
+  its audio chunk while validating the historical inner-length overcount.
+- Corrected older mixer EQ offsets using the 284/288-byte settings lengths and
+  retained the nonboolean companion field as a raw value.
 - Established redistribution-safe fixtures for application versions 0.70,
   0.71, 0.75, 0.76, 0.80, 0.802, and 0.81.
 - Distinguished direct and framed instrument keymap/prefix layouts despite

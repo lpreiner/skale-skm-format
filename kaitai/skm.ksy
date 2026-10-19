@@ -9,7 +9,7 @@ doc: |
   (no Skale binary was disassembled, decompiled, or debugged -- see
   `PROVENANCE.md`). Ported from the independent reference parser
   `skmparse.py`; field names and confidence levels below mirror it exactly,
-  status as of 2026-08-22. Canonical project:
+  status as of 2026-10-19. Canonical project:
   https://github.com/lpreiner/skale-skm-format
 
   Covers: the flat/recursive chunk container, the file header, song text
@@ -21,8 +21,7 @@ doc: |
   Skale-owned routing tail.
 
   KNOWN GAPS, not yet done (see PROVENANCE.md Sec 6 item 15 for the full
-  list with reasoning): a general declarative discriminator for every 0.76
-  instrument-prefix variant; the internal structure of section 6's
+  list with reasoning): the internal structure of section 6's
   Skale-owned routing/send tail; reserved/last_row absolute-row
   padding (tokens here are still track-local, unlike skmparse.py's
   parse_tracks); and skmparse.py's cross-record consistency checks
@@ -186,105 +185,84 @@ types:
         doc: >
           Skale's "REPEAT PATT." field: the order position to restart at
           after reaching the end of the song.
-      - id: pattern_data
-        size: _io.size - _io.pos - 8
-        type: pattern_data_t(channel_count)
-        doc: Everything from offset 0x103 up to the fixed 8-byte section tail.
-      - id: tail
-        size: 8
+      - id: patterns
+        type: pattern_chunk(channel_count)
+        repeat: until
+        repeat-until: _.tag == 0xffff or _io.eof
+        doc: >
+          An ordinary chunk list from offset 0x103, closed by the standard
+          EOF chunk (01 00 FF FF 00 00 00 00 -- formerly "the 8-byte section
+          tail"). PROVENANCE.md Sec 5.15, 171/171 files exact.
 
-  pattern_data_t:
-    params:
-      - id: channel_count
-        type: u1
-    seq:
-      - id: records
-        type: pattern_record(channel_count)
-        repeat: eos
-
-  pattern_record:
+  pattern_chunk:
     doc: |
-      One pattern. `next_record = (offset of packed_size) + packed_size + 4`;
-      expressed here as a self-sized substream (`tracks_raw`) plus the
-      fixed 4-byte trailer, so no manual offset arithmetic is needed.
+      One pattern as an ordinary (id=1, tag=1, u32 length) chunk. The
+      historical "signature 01 00 01 00 + u16 packed_size + u16 reserved"
+      is this header; the reserved word is the length's high half.
     params:
       - id: channel_count
         type: u1
     seq:
-      - id: signature
-        contents: [0x01, 0x00, 0x01, 0x00]
-      - id: packed_size
+      - id: id
         type: u2
-        doc: Counted from this field's own offset.
-      - id: reserved1
+      - id: tag
         type: u2
-        doc: Always 0 so far.
+      - id: len
+        type: u4
+      - id: body
+        size: len
+        type:
+          switch-on: tag
+          cases:
+            1: pattern_body(channel_count)
+
+  pattern_body:
+    params:
+      - id: channel_count
+        type: u1
+    seq:
       - id: pattern_index
         type: u1
-      - id: rows_raw
-        type: u1
-        doc: On-disk row count; 0 means 256 (u8 overflow -- see `rows`).
-      - id: reserved2
-        type: u1
-        doc: Always 0 so far.
-      - id: reserved3
-        type: u1
-        doc: Always 1 so far.
-      - id: reserved4
-        type: u1
-        doc: Always 1 so far.
-      - id: tracks_raw
-        size: packed_size - 9
-        type: tracks_t(channel_count)
-      - id: trailer
-        size: 4
-        doc: Observed constant 01 ff 00 00; not contents-matched to stay tolerant of an unseen corpus file.
-    instances:
-      rows:
-        value: "rows_raw == 0 ? 256 : rows_raw"
+      - id: rows
+        type: u2
         doc: >
-          Confirmed real via a paired .xm export (n_rows=256) with intact,
-          decodable content past row 255; Skale's own UI refused to grow a
-          maxed-out pattern further, so 256 is a hard ceiling, never a
-          larger multiple.
+          Row count as a u16 (Verified, Sec 5.15): every 256-row pattern
+          Skale wrote stores 00 01. The former "u8 rows, 0 means 256" model
+          read only the low byte and called the high byte reserved.
+      - id: tracks
+        type: track_chunk
+        repeat: until
+        repeat-until: _.tag == 0xff or _io.eof
+        doc: >
+          Channel-major: one track per channel, then an end marker
+          (01 ff 00 00, formerly "the 4-byte trailer").
 
-  tracks_t:
+  track_chunk:
     doc: |
-      Channel-major, not a flat cell stream: one track per channel, each
-      internally self-delimited by its own `length`, with a literal
-      `01 01` separator between tracks (absent after the last one).
-    params:
-      - id: channel_count
+      Half-width chunk header (u8 id, u8 tag, u16 length). The former
+      "01 01 separator" is a track header's id/tag bytes.
+    seq:
+      - id: id
         type: u1
-    seq:
-      - id: entries
-        type: track_entry(_index, channel_count)
-        repeat: expr
-        repeat-expr: channel_count
-
-  track_entry:
-    params:
-      - id: idx
-        type: s4
-      - id: total
-        type: s4
-    seq:
+        valid: 1
+      - id: tag
+        type: u1
+        valid:
+          any-of: [1, 0xff]
+      - id: len_track
+        type: u2
       - id: track
+        size: len_track
         type: track
-      - id: separator
-        size: 2
-        if: idx < (total - 1)
-        doc: Literal 01 01, present between tracks only (not after the last).
+        if: tag == 1
 
   track:
     seq:
-      - id: len
-        type: u2
       - id: channel_index
         type: u1
         doc: Sequential 0..channel_count-1.
       - id: events
-        size: len - 1
+        size-eos: true
         type: events_body
 
   events_body:
@@ -665,60 +643,248 @@ types:
         type: u4
       - id: body
         size: length
-        type: instrument_record(version_raw)
+        type: instrument_record(version_raw, id)
         if: tag != 0xffff
 
   instrument_record:
     doc: |
-      One instrument. Only `index`/`name` (the outer shell) plus, for
-      pre-0.76 files, the fixed-size envelope/keymap gap and the nested
-      sample-chunk list are decoded here -- see PROVENANCE.md §7.
-      0.76 files leave everything past the name as `remainder_raw`: the
-      gap there is genuinely one of 8 distinct sizes with no known
-      discriminant field yet (not a simple version check, and not a
-      smooth per-record continuum either). Rights-safe controlled fixtures
-      prove that a 412-byte 0.76 prefix starts with the same direct 96-byte
-      keymap used before 0.76, while a 1056-byte 0.76 prefix starts with 96
-      framed six-byte entries. Because both carry version_raw 7600, nothing
-      past this point can be honestly typed from the version alone; this
-      declarative spec keeps it opaque pending a safe layout discriminator.
+      Instrument chunk ID is its record version. IDs 3/4 use 128 direct
+      keymap bytes; IDs 5/6 use 128 variable-length framed entries. The
+      settings block is 401, 284, 284, or 288 bytes respectively. The first
+      96 keymap entries correspond to playable notes. Unknown versions keep
+      their bounded remainder raw; the file header alone cannot select layout.
     params:
       - id: version_raw
         type: u4
+      - id: record_version
+        type: u2
     seq:
       - id: index
         type: u1
       - id: name
         type: strz
         encoding: ISO-8859-1
-        doc: First/primary sample's name, or the instrument's own name for a sample-less (e.g. VSTi) instrument.
-      - id: pre76_keymap
+      - id: direct_keymap
         type: u1
         repeat: expr
-        repeat-expr: 96
-        if: version_raw != 7600
-        doc: >
-          Verified direct 96-note note-to-local-sample-slot map used by
-          pre-0.76 instruments. Values index the nested sample slots;
-          references to empty or absent slots intentionally remain silent.
-      - id: pre76_envelope_keymap_remainder_raw
-        size: 433
-        if: version_raw != 7600
-        doc: >
-          Remaining undecoded envelope/settings bytes. Together with the
-          96-byte keymap this forms the verified fixed 529-byte pre-0.76
-          region; the nested chunk list begins immediately afterward.
-      - id: nested_pre76
+        repeat-expr: 128
+        if: record_version == 3 or record_version == 4
+      - id: framed_keymap
+        type: keymap_entry
+        repeat: expr
+        repeat-expr: 128
+        if: record_version == 5 or record_version == 6
+      - id: settings
+        type: instrument_settings(record_version)
+        size: 'record_version == 3 ? 401 : (record_version == 6 ? 288 : 284)'
+        if: record_version >= 3 and record_version <= 6
+      - id: nested
         type: instrument_nested_list
-        if: version_raw != 7600
-        doc: Sample sub-chunks (id=1/tag=1) plus undecoded param/envelope entries (id=3/tag=2), terminated by the standard EOF chunk.
+        if: record_version >= 3 and record_version <= 6
       - id: remainder_raw
         size-eos: true
-        if: version_raw == 7600
-        doc: Everything past the name, undecoded. Known 0.76 keymap layouts are documented in this type's docstring but intentionally not guessed here.
+        if: record_version < 3 or record_version > 6
+
+  keymap_entry:
+    doc: |
+      `00 00` (unmapped) or `01 01 <slot> 00 7F 00` in every observed file.
+      Read as flag + layer count + 4-byte layers (Sec 5.15); that the second
+      byte is a count and the 00/7F pair a range is Conjecture, so layer
+      bytes beyond the slot are kept raw.
+    seq:
+      - id: flag
+        type: u1
+        valid:
+          any-of: [0, 1]
+      - id: num_layers
+        type: u1
+        valid:
+          expr: (_ > 0) == (flag == 1)
+      - id: layers
+        type: keymap_layer
+        repeat: expr
+        repeat-expr: num_layers
+    instances:
+      mapped:
+        value: flag == 1
+      local_slot:
+        value: 'num_layers > 0 ? layers[0].local_slot : 0'
+
+  keymap_layer:
+    seq:
+      - id: local_slot
+        type: u1
+      - id: layer_raw
+        size: 3
+        doc: Observed constant 00 7F 00.
+
+  instrument_settings:
+    params:
+      - id: record_version
+        type: u2
+    seq:
+      - id: fadeout
+        type: u2
+      - id: unknown_2
+        size: 4
+      - id: mute_toggle
+        type: u1
+      - id: toggle01
+        type: u1
+      - id: note_death
+        type: u1
+      - id: volume_fader
+        type: f4
+      - id: bal
+        type: f4
+      - id: unknown_17
+        size: 8
+        doc: Zero in every observed record.
+      - id: table_25
+        size: 64
+        doc: >
+          Identity (entry i == i) in 1777/1793 corpus records; the only
+          deviations remap entry 7 to 16 or 17. Meaning unidentified.
+      - id: u8_89
+        type: u1
+        doc: >
+          Offsets 89-127 are a probable instrument-filter block (Conjecture,
+          Sec 5.15): defaults 5000/5000/50/0.5/0.5/0/10, edited floats move
+          in steps of 1/42 of their default, u8_122 is a 1/2/4/6/7 bitmask.
+      - id: f32_90
+        type: f4
+      - id: f32_94
+        type: f4
+      - id: u8_98
+        type: u1
+      - id: unknown_99
+        size: 3
+      - id: f32_102
+        type: f4
+      - id: f32_106
+        type: f4
+      - id: f32_110
+        type: f4
+      - id: f32_114
+        type: f4
+      - id: f32_118
+        type: f4
+      - id: u8_122
+        type: u1
+      - id: unknown_123
+        size: 3
+      - id: u8_126
+        type: u1
+      - id: u8_127
+        type: u1
+      - id: unknown_128
+        size: 2
+      # ID 3 (0.70-0.75) tail: 1 + 7 + 1 + 16 x 13 + 54 = 271 bytes.
+      - id: legacy_byte_130
+        type: u1
+        if: record_version == 3
+        doc: 0xFF in every observed record.
+      - id: legacy_unknown_131
+        size: 7
+        if: record_version == 3
+      - id: legacy_byte_138
+        type: u1
+        if: record_version == 3
+        doc: 0x7F in every observed record.
+      - id: legacy_send_knobs
+        type: legacy_send_knob
+        repeat: expr
+        repeat-expr: 16
+        if: record_version == 3
+      - id: legacy_tail_raw
+        size: 54
+        if: record_version == 3
+        doc: Zero except u32 1 at block offsets 364 and 368.
+      # IDs 4-6.
+      - id: unknown_130
+        size: 2
+        if: record_version != 3
+      - id: unknown_132
+        size: 16
+        if: record_version != 3
+        doc: All 0xFF in every observed record.
+      - id: unknown_148
+        size: 4
+        if: record_version != 3
+      - id: toggle01_companion
+        type: u1
+        if: record_version != 3
+        doc: Not universally boolean (12 in one record); meaning unidentified.
+      - id: unknown_153
+        size: 2
+        if: record_version != 3
+      - id: byte_155
+        type: u1
+        if: record_version != 3
+        doc: 0x7F in all but one observed record.
+      - id: send_knobs
+        type: send_knob
+        repeat: expr
+        repeat-expr: 16
+        if: record_version != 3
+        doc: >
+          Knob 0 is the GUI-verified FX-send "01" knob (singlevar/50);
+          knobs 8-15 are never edited in the corpus.
+      - id: unknown_252
+        type: u1
+        if: record_version != 3
+      - id: sub_assign
+        type: u1
+        repeat: expr
+        repeat-expr: 4
+        if: record_version != 3
+      - id: eq
+        type: instrument_eq_band
+        repeat: expr
+        repeat-expr: 3
+        if: record_version != 3
+      - id: color_bgr
+        size: 3
+        if: record_version == 6
+      - id: color_pad
+        type: u1
+        if: record_version == 6
+
+  send_knob:
+    seq:
+      - id: flag
+        type: u1
+      - id: value
+        type: f4
+      - id: index
+        type: u1
+
+  legacy_send_knob:
+    doc: >
+      ID 3 knob record; flag/value match the ID 6 resave of the same song
+      1392/1392 (Sec 5.15). The two trailing floats are 0.0 and 1.0 in
+      every observed record.
+    seq:
+      - id: flag
+        type: u1
+      - id: value
+        type: f4
+      - id: aux_a
+        type: f4
+      - id: aux_b
+        type: f4
+
+  instrument_eq_band:
+    seq:
+      - id: enabled_flag
+        type: u1
+      - id: gain
+        type: f4
+      - id: freq
+        type: f4
 
   instrument_nested_list:
-    doc: The generic id/tag/length chunk-list shape, one more time. Populated sample sub-chunks are decoded; short empty placeholders remain explicit raw tails.
+    doc: The generic id/tag/length chunk-list shape, one more time. Sample slots decode metadata and inner audio lists; empty slots contain EOF alone.
     seq:
       - id: entries
         type: generic_chunk
@@ -742,103 +908,67 @@ types:
             true: sample_subchunk
 
   sample_subchunk:
-    doc: |
-      One instrument-local sample slot. Populated records have a verified
-      27-byte metadata header, a length-delimited audio payload, and a fixed
-      3-byte trailer. Empty placeholders end after a shorter 22-byte tail and
-      are deliberately retained rather than forced through the populated form.
+    doc: Fourteen metadata bytes after the slot/name, then audio chunks and EOF.
     seq:
       - id: local_slot
         type: u1
       - id: name
         type: strz
         encoding: ISO-8859-1
-      - id: body
-        size-eos: true
-        type:
-          switch-on: _io.size - _io.pos
-          cases:
-            22: sample_placeholder
-            _: populated_sample_body
-
-  sample_placeholder:
-    doc: Undecoded short empty-slot metadata; 22 bytes in every observed instance.
-    seq:
-      - id: raw
-        size-eos: true
-
-  populated_sample_body:
-    seq:
       - id: metadata
         type: sample_metadata
-      - id: audio_data
-        size: metadata.audio_data_length
-        doc: |
-          Raw PCM data plus its fixed 5-byte inner tail, or the self-contained
-          Ogg length/stream/padding payload.
+      - id: audio_chunks
+        type: sample_audio_chunk
+        repeat: until
+        repeat-until: _.length == 0 or _io.eof
 
-          Deliberately left as raw bytes. Decoding the Ogg framing here would
-          size a field from `inner_length`, an untrusted value, and a file that
-          declares a bad one would then fail during *container* parsing -- which
-          contradicts this repository's layering, where framing damage is the
-          container's to reject and payload damage belongs to a later
-          validation step. `tests/fixtures/generated/ogg-inner-length-overrun.skm`
-          is the case in point: its container closes exactly, and it is marked
-          `expected_parse: success`. Use the `ogg` instance below to decode the
-          framing, and treat a failure there as payload rejection.
-      - id: trailer
-        size: 3
-        doc: Fixed record trailer, observed as 00 00 00.
+  sample_audio_chunk:
+    doc: |
+      Populated slots have one tag=1 audio chunk followed by EOF. Empty
+      slots have EOF alone. Preserve terminal header values for semantic
+      validation, including fixtures with damaged EOF bytes.
+    seq:
+      - id: format
+        type: u2
+      - id: tag
+        type: u2
+      - id: length
+        type: u4
+      - id: body
+        size: length
+        type: sample_audio_body
+        if: length != 0
+
+  sample_audio_body:
+    seq:
+      - id: stored_value_count
+        type: u4
+        doc: Total interleaved sample values, not per-channel frames.
+      - id: channels
+        type: u1
+      - id: payload
+        size-eos: true
+        doc: PCM bytes or u32 Ogg inner length plus the Ogg stream; excludes EOF.
     instances:
       ogg:
-        pos: sizeof<sample_metadata>
-        size: metadata.audio_data_length
+        pos: 5
+        size: _io.size - 5
         type: ogg_payload
-        if: metadata.format == sample_format::ogg_vorbis
-        doc: |
-          Lazy Ogg framing decode. Evaluating this is the validation step: it
-          raises on a malformed `inner_length` rather than making the whole
-          container unparseable. Consumers that only need structure can ignore
-          it.
+        if: _parent.format == 4
 
   ogg_payload:
     doc: |
-      Ogg Vorbis sample payload: an inner length, the self-contained Vorbis
-      stream, and Skale's fixed four-byte padding. The padding is counted
-      inside `inner_length`.
-
-      A decoder must be handed `stream` only. Passing the padding through --
-      even just the trailing two bytes -- can leave a push-mode Vorbis decoder
-      consuming nothing while reporting "need more data", which spins a
-      length-driven read loop forever after the audio has already been fully
-      decoded. Verified 1032/1032 corpus Ogg samples and 3/3 public fixtures.
-
-      Not currently reachable by this spec: every observed Ogg-bearing file is
-      `version_raw == 7600`, and 0.76 instrument bodies are still `remainder_raw`.
-      This type documents the verified layout and is already wired to
-      `audio_data`'s format switch, so it becomes live as soon as the 0.76
-      instrument prefix is decoded.
+      The inner length is self-inclusive: it counts its own four bytes plus
+      the stream, which ends exactly at the audio chunk's end (1032/1032,
+      Sec 5.15). Older notes called this an overcount into the EOF header.
+      Consumers require inner_length == stream.size + 4, OggS magic, and a
+      valid following EOF.
+      This lazy view leaves malformed payloads inspectable at container level.
     seq:
       - id: inner_length
         type: u4
-        doc: Byte count of `stream` plus `padding`.
       - id: stream
-        size: inner_length - 4
-        doc: Complete self-contained Ogg/Vorbis stream, starting with `OggS` magic. Vorbis carries its own sample rate, so no external rate is needed.
-      - id: padding
-        size: 4
-        doc: |
-          Skale-owned padding after the real Ogg EOS, `01 00 FF FF` in every
-          conforming stream. Not Vorbis data; carries no audio.
-
-          Declared by size rather than by `contents`: this spec describes
-          container structure, and payload values are the consumer's to
-          validate. A file whose padding bytes are wrong is still structurally
-          well formed -- every length field still closes exactly -- so it
-          should parse here and be rejected by whatever reads the stream.
-          Asserting the value with `contents` would make a generated parser
-          refuse a structurally sound file, which neither the reference parser
-          nor the loader does.
+        size-eos: true
 
   sample_metadata:
     doc: Verified fixed header immediately following a populated sample name.
@@ -864,20 +994,6 @@ types:
       - id: loop_type
         type: u1
         enum: sample_loop_type
-      - id: format
-        type: u2
-        enum: sample_format
-      - id: unknown_b
-        type: u2
-        doc: Observed as 1.
-      - id: audio_data_length
-        type: u4
-      - id: stored_value_count
-        type: u4
-        doc: Total interleaved sample values; divide by channels to obtain the per-channel frame count.
-      - id: channels
-        type: u1
-        doc: Verified values are 1 and 2.
 
 enums:
   sample_loop_type:

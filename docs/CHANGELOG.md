@@ -4,6 +4,16 @@
 
 ## Unreleased — initial public repository
 
+- Section 6: the bytes after a VSTi's counted plugin parameters are a fixed
+  110-byte per-synth mixer strip (16 send knobs, BAL, fader, SUB assign, a
+  toggle). Kaitai rejects shorter or longer strips.
+- The 32 `tag=2` instrument sub-chunks form one 8 × 4 grid (steps A..H ×
+  volume, panning and two further envelopes) with one variable-length layout.
+- `toggle01_companion` moved from settings +152 to +252, where it is always
+  `1 - toggle01`. +127 and +149 are the VSTi device index and enable flag; +126
+  is named by correlation only.
+- Note value `0x80` never occurs under the two-mode row grammar; it is removed
+  from the open questions.
 - Read section 2 as chunk lists: pattern chunks, half-width track chunks, and
   their end markers account for every former unknown/separator/trailer byte.
   The pattern row count is a `u16` (Skale writes 256 as `00 01`); the

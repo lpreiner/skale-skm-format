@@ -17,12 +17,13 @@ doc: |
   per-channel tracks, and the confirmed two-mode per-row event grammar),
   section 4 (FX chain), section 5 (global/mixer, both the 4-byte pre-0.76
   and 424-byte shape observed in 0.76), section 3's verified instrument
-  variants, and section 6's counted VSTi parameter prefix plus bounded
-  Skale-owned routing tail.
+  variants (including the 128-entry keymap, versioned settings block,
+  sample sub-chunks, and 32-entry 8x4 variable-length envelope grid),
+  and section 6's counted VSTi parameter prefix plus fixed 110-byte
+  Skale-owned per-synth mixer strip.
 
-  KNOWN GAPS, not yet done (see PROVENANCE.md Sec 6 item 15 for the full
-  list with reasoning): the internal structure of section 6's
-  Skale-owned routing/send tail; reserved/last_row absolute-row
+  KNOWN GAPS, not yet done (see PROVENANCE.md Sec 6 for the full
+  list with reasoning): reserved/last_row absolute-row
   padding (tokens here are still track-local, unlike skmparse.py's
   parse_tracks); and skmparse.py's cross-record consistency checks
   (order_list_in_range and friends), which this spec doesn't re-assert.
@@ -362,11 +363,12 @@ types:
           (is_compressed and has_effect_cmd) ? compressed_effect_cmd.as<s4> : -1
       note_effective:
         doc: >
-          Raw on-disk value. 0x81=Note Off (Verified). 0x80 as a *note*
-          value remains unidentified and is distinct from `marker`'s own
-          0x80, which means "empty row" at the row-token level. The extended
-          instrument editor's Note Death Cut/Note Off policy is not evidence
-          that this pattern value means Note Cut.
+          Raw on-disk value. 0..95 = musical pitches C-0..B-7; 0x81 = Note Off
+          (Verified). Under the verified two-mode event grammar, 0x80 occurs
+          0 times across all 239,260 note events in the workspace (the earlier
+          315-occurrence count in pre-2026-08-08 notes was a single-mode parser
+          artifact that misread literal-row bytes). The extended instrument
+          editor's Note Death Cut/Note Off policy is an instrument-level setting.
         value: >
           is_literal ? literal_note.as<s4> :
           (is_compressed and has_note) ? compressed_note.as<s4> : -1
@@ -476,9 +478,9 @@ types:
     doc: |
       Top-level tag 6. A clean Skale 0.81 mdaJX10 causal family verifies
       one nested record per loaded synth slot. UI slot 01 is stored as
-      slot_index 0. Plugin parameters have an explicit count; bytes after
-      them are Skale-owned synth routing/send state and remain raw pending
-      further causal isolation.
+      slot_index 0. Plugin parameters have an explicit count, followed by a
+      fixed 110-byte Skale-owned per-synth mixer strip (Verified across all
+      29/29 workspace VSTi records).
     seq:
       - id: entries
         type: vsti_chunk
@@ -514,9 +516,55 @@ types:
         type: f4
         repeat: expr
         repeat-expr: plugin_param_count
-      - id: skale_state_raw
+      - id: skale_state
+        size: 110
+        type: vsti_skale_state
+        doc: Fixed 110-byte Skale-owned per-synth mixer strip (Sec 5.16, 29/29 exact).
+      - id: trailing_bytes
         size-eos: true
-        doc: Skale-owned per-synth routing/send state; internal structure not yet generalized.
+        valid:
+          expr: _.size == 0
+        doc: The fixed mixer strip must exhaust this bounded synth record.
+
+  vsti_skale_state:
+    doc: |
+      110-byte Skale-owned per-synth mixer strip in Section 6 (Verified across
+      all 29/29 workspace VSTi records and causal fixtures 63, 64, 66, 67, 68).
+    seq:
+      - id: unknown_0
+        type: u1
+        doc: 0x00 in all 29 observed records.
+      - id: send_knobs
+        type: vsti_send_knob
+        repeat: expr
+        repeat-expr: 16
+        doc: >
+          16 x 6-byte send-knob records (flag, f32 value, u8 pad). Knob 0's
+          value is causally verified by singlevar/64, 66, 67, 68 (1.0 -> 2.125
+          / 2.5 / 0.0); knobs 0..7 are edited in singlevar/63.
+      - id: bal
+        type: f4
+        doc: Zero-centered in [-0.5, +0.5], default 0.0 (Verified, singlevar/63).
+      - id: volume_fader
+        type: f4
+        doc: Default 1.0 (Verified, singlevar/63).
+      - id: sub_assign
+        type: u1
+        repeat: expr
+        repeat-expr: 4
+        doc: SUB1..SUB4 routing booleans in {0, 1} (Verified, singlevar/63).
+      - id: mute_or_toggle
+        type: u1
+        doc: Per-synth mixer strip 01 toggle in {0, 1} (Verified, singlevar/63).
+
+  vsti_send_knob:
+    seq:
+      - id: flag
+        type: u1
+      - id: value
+        type: f4
+      - id: pad
+        type: u1
 
   global_section:
     doc: |
@@ -748,7 +796,7 @@ types:
       - id: u8_89
         type: u1
         doc: >
-          Offsets 89-127 are a probable instrument-filter block (Conjecture,
+          Offsets 89-125 are a probable instrument-filter block (Conjecture,
           Sec 5.15): defaults 5000/5000/50/0.5/0.5/0/10, edited floats move
           in steps of 1/42 of their default, u8_122 is a 1/2/4/6/7 bitmask.
       - id: f32_90
@@ -773,10 +821,17 @@ types:
         type: u1
       - id: unknown_123
         size: 3
-      - id: u8_126
+      - id: ext_synth_mode
         type: u1
-      - id: u8_127
+        doc: >
+          Instr. Ed. Ext. mode (Sec 5.16), named by correlation only: 1 on all
+          13 distinct VSTi-linked instrument records observed, 0 elsewhere.
+          No causal save has changed it.
+      - id: vsti_device
         type: u1
+        doc: >
+          0-based Section 6 VSTi synth slot index (Verified, singlevar/46:
+          Device 01 -> 0, Device 02 -> 1).
       - id: unknown_128
         size: 2
       # ID 3 (0.70-0.75) tail: 1 + 7 + 1 + 16 x 13 + 54 = 271 bytes.
@@ -809,19 +864,30 @@ types:
         if: record_version != 3
         doc: All 0xFF in every observed record.
       - id: unknown_148
-        size: 4
-        if: record_version != 3
-      - id: toggle01_companion
         type: u1
         if: record_version != 3
-        doc: Not universally boolean (12 in one record); meaning unidentified.
+      - id: vsti_device_enabled
+        type: u1
+        if: record_version != 3
+        doc: >
+          Instr. Ed. Ext. Device enable light in {0, 1} (Verified, singlevar/37
+          vs 45 and 46 vs 47).
+      - id: unknown_150
+        size: 2
+        if: record_version != 3
+      - id: byte_152
+        type: u1
+        if: record_version != 3
+        doc: >
+          0 in 1324/1325 records, 12 in VANGard.skm instrument 1 (formerly
+          mislabeled toggle01_companion due to a -136 vs -36 offset typo).
       - id: unknown_153
         size: 2
         if: record_version != 3
       - id: byte_155
         type: u1
         if: record_version != 3
-        doc: 0x7F in all but one observed record.
+        doc: 0x7F in all but one observed record (0 in VANGard.skm instrument 0).
       - id: send_knobs
         type: send_knob
         repeat: expr
@@ -830,9 +896,12 @@ types:
         doc: >
           Knob 0 is the GUI-verified FX-send "01" knob (singlevar/50);
           knobs 8-15 are never edited in the corpus.
-      - id: unknown_252
+      - id: toggle01_companion
         type: u1
         if: record_version != 3
+        doc: >
+          Verified via singlevar/60_instrument_toggles.skm (sample_list_start - 36
+          in ID 6): equals 1 - toggle01 across 1325/1325 records in IDs 4-6.
       - id: sub_assign
         type: u1
         repeat: expr
@@ -849,6 +918,11 @@ types:
       - id: color_pad
         type: u1
         if: record_version == 6
+    instances:
+      u8_126:
+        value: ext_synth_mode
+      u8_127:
+        value: vsti_device
 
   send_knob:
     seq:
@@ -884,7 +958,11 @@ types:
         type: f4
 
   instrument_nested_list:
-    doc: The generic id/tag/length chunk-list shape, one more time. Sample slots decode metadata and inner audio lists; empty slots contain EOF alone.
+    doc: |
+      The generic id/tag/length chunk-list shape, one more time. Populated
+      sample slots (id=1, tag=1) are followed by 32 variable-length envelope
+      sub-chunks (id=2 in record versions 3/4, id=3 in record versions 5/6;
+      tag=2) forming an 8x4 grid (row 0..7 x col 1..4), closed by EOF.
     seq:
       - id: entries
         type: generic_chunk
@@ -892,7 +970,9 @@ types:
         repeat-until: _.tag == 0xffff or _io.eof
 
   generic_chunk:
-    doc: A nested instrument chunk. id=1/tag=1 is a sample slot; other parameter/envelope record families remain raw.
+    doc: |
+      A nested instrument chunk: tag=1 (id=1) is a sample slot; tag=2
+      (id=2 or 3) is one of the 32 envelope grid sub-chunks; tag=0xffff is EOF.
     seq:
       - id: id
         type: u2
@@ -903,9 +983,55 @@ types:
       - id: body
         size: length
         type:
-          switch-on: id == 1 and tag == 1
+          switch-on: tag
           cases:
-            true: sample_subchunk
+            1: sample_subchunk
+            2: instrument_envelope_subchunk(id)
+
+  instrument_envelope_subchunk:
+    doc: |
+      One slot in the 8x4 per-instrument envelope grid (Verified, 57,376/57,376
+      corpus sub-chunks exact, Sec 5.16). `row` is 0..7 (steps A..H, where 0 is
+      the active step A and 1..7 are presets B..H); `col` is 1..4 (1 = volume,
+      2 = panning, 3 and 4 = two additional instrument envelopes). Length is
+      `9 + 4 * num_points` when chunk_id == 2 (record versions 3/4) and
+      `10 + 4 * num_points` when chunk_id == 3 (record versions 5/6).
+    params:
+      - id: chunk_id
+        type: u2
+    seq:
+      - id: row
+        type: u1
+      - id: col
+        type: u1
+      - id: enabled
+        type: u1
+      - id: num_points
+        type: u1
+      - id: points
+        type: envelope_point
+        repeat: expr
+        repeat-expr: num_points
+      - id: sustain_enabled
+        type: u1
+      - id: sustain_point
+        type: u1
+      - id: loop_enabled
+        type: u1
+      - id: loop_start
+        type: u1
+      - id: loop_end
+        type: u1
+      - id: reserved
+        type: u1
+        if: chunk_id == 3
+
+  envelope_point:
+    seq:
+      - id: x
+        type: u2
+      - id: y
+        type: u2
 
   sample_subchunk:
     doc: Fourteen metadata bytes after the slot/name, then audio chunks and EOF.

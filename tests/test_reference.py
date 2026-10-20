@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 
 
@@ -293,8 +296,107 @@ class ReferenceParserSmokeTests(unittest.TestCase):
         chunk = self.make_instrument(5)
         body = bytearray(chunk.data)
         body[8 + 6 + 768 + 152] = 12
+        body[8 + 6 + 768 + 252] = 1
         entry = p.parse_instruments(p.Chunk(0, 1, 3, len(body), bytes(body)), 7600)["instruments"][0]
-        self.assertEqual(entry["mixer_strip"]["toggle01_companion"], 12)
+        self.assertEqual(entry["settings"]["byte_152"], 12)
+        self.assertEqual(entry["mixer_strip"]["toggle01_companion"], 1)
+
+    def test_vsti_skale_state_and_envelope_grid(self):
+        p = self.parser
+        vsti = self.parse_fixture("vsti-linked-081.skm")
+        s6 = vsti["section6"]["entries"][0]
+        self.assertTrue(s6["skale_state_exact"])
+        self.assertEqual(len(s6["skale_state"]["send_knobs"]), 16)
+        self.assertEqual(s6["skale_state"]["volume_fader"], 1.0)
+        self.assertEqual(s6["skale_state"]["bal"], 0.0)
+        self.assertEqual(s6["skale_state"]["sub_assign"], [0, 0, 0, 0])
+        self.assertEqual(s6["skale_state"]["mute_or_toggle"], 0)
+        inst = vsti["instruments"]["instruments"][0]
+        self.assertEqual(inst["settings"]["ext_synth_mode"], 1)
+        self.assertEqual(inst["settings"]["vsti_device"], 0)
+        self.assertTrue(inst["envelope_grid_exact"])
+        self.assertEqual(len(inst["envelope_grid"]), 32)
+
+    def rewrite_first_fixture_record(self, section, transform):
+        """Mutate a safe fixture while recalculating enclosing chunk lengths."""
+        p = self.parser
+        raw = (ROOT / "tests/fixtures/authentic/vsti-linked-081.skm").read_bytes()
+
+        def pack(chunk, data=None):
+            data = chunk.data if data is None else data
+            return p.HDR.pack(chunk.id, chunk.tag, len(data)) + data
+
+        result = []
+        for chunk in p.read_chunks(raw)[0]:
+            if chunk.tag == section:
+                records = p.read_chunks(chunk.data)[0]
+                body = pack(records[0], transform(records[0]))
+                body += b"".join(pack(record) for record in records[1:])
+                result.append(pack(chunk, body))
+            else:
+                result.append(pack(chunk))
+        return b"".join(result)
+
+    def test_verifier_rejects_incomplete_or_reordered_envelope_grid(self):
+        p = self.parser
+
+        def change_grid(record, mode):
+            _, name_end = p.cstring(record.data, 1)
+            start = p.instrument_prefix(record.data, name_end, record.id)[2]
+            nested = p.read_chunks(record.data[start:])[0]
+            indices = [i for i, chunk in enumerate(nested) if chunk.tag == 2]
+            if mode == "missing":
+                del nested[indices[-1]]
+            elif mode == "duplicate":
+                nested[indices[-1]] = nested[indices[0]]
+            elif mode == "reordered":
+                a, b = indices[:2]
+                nested[a], nested[b] = nested[b], nested[a]
+            return record.data[:start] + b"".join(
+                p.HDR.pack(c.id, c.tag, len(c.data)) + c.data for c in nested)
+
+        for mode in ("valid", "missing", "duplicate", "reordered"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as folder:
+                raw = self.rewrite_first_fixture_record(
+                    3, lambda record: change_grid(record, mode))
+                path = Path(folder) / "grid.skm"
+                path.write_bytes(raw)
+                grid_exact = p.parse_skm(path)["instruments"]["instruments"][0]["envelope_grid_exact"]
+                self.assertEqual(grid_exact, mode == "valid")
+                result = subprocess.run(
+                    [sys.executable, str(ROOT / "reference/skmparse.py"),
+                     "--verify-corpus", folder], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0 if mode == "valid" else 1,
+                                 result.stdout + result.stderr)
+                if mode != "valid":
+                    self.assertIn("envelope grid", result.stdout)
+
+    def test_generated_kaitai_rejects_nonexact_synth_state_length(self):
+        compiler = shutil.which("kaitai-struct-compiler")
+        if not compiler or importlib.util.find_spec("kaitaistruct") is None:
+            self.skipTest("requires Kaitai compiler and official Python runtime")
+        with tempfile.TemporaryDirectory() as folder:
+            subprocess.run(
+                [compiler, "-t", "python", "--outdir", folder,
+                 str(ROOT / "kaitai/skm.ksy")],
+                check=True, capture_output=True, text=True)
+            spec = importlib.util.spec_from_file_location(
+                "regression_generated_skm", Path(folder) / "skm.py")
+            generated = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(generated)
+            for mode in ("valid", "short", "extra"):
+                with self.subTest(mode=mode):
+                    raw = self.rewrite_first_fixture_record(
+                        6, lambda r: r.data[:-1] if mode == "short" else
+                        r.data + b"\xab" if mode == "extra" else r.data)
+                    if mode == "valid":
+                        parsed = generated.Skm.from_bytes(raw)
+                        section = next(c.body for c in parsed.chunks if c.tag == 6)
+                        self.assertTrue(section.entries[0].body._io.is_eof())
+                    else:
+                        import kaitaistruct
+                        with self.assertRaises((EOFError, kaitaistruct.ValidationFailedError)):
+                            generated.Skm.from_bytes(raw)
 
     def test_bad_known_keymap_is_rejected_without_scanning(self):
         p = self.parser

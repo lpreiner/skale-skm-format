@@ -89,19 +89,34 @@ uses the bounded stream. Existing malformed Ogg fixtures remain structurally ins
 and fail payload validation. The unknown byte at metadata offset 4 remains raw.
 
 The historical companion field at settings offset 152 is not universally a
-boolean (a private record contains 12); it is preserved without assigning new
-semantics or rejecting an otherwise valid mixer strip.
+boolean (a private record contains 12); a 2026-10-19 re-diff of the toggle
+fixture pair established that `toggle01_companion` is at settings offset 252
+(`sample_list_start - 36` in ID 6, `== 1 - toggle01` across all 1,294 private
+and 31 public ID 4–6 records), while offset 152 is a separate byte in the
+extended instrument editor region.
 
-### 3.5 Settings skeleton and keymap entries (2026-10-19)
+### 3.5 Settings skeleton, 8×4 envelope grid, and keymap entries (2026-10-19)
 
 Every byte of the settings blocks is now assigned to a field or a constant
 run. The 16 send-knob records are 13 bytes in ID 3 and 6 bytes in IDs 4–6.
 A private 0.75 song and its 0.81 resave agree on all 1392 knob flags and
 values, and a private causal save places the mixer's first send knob at
-knob 0. The probable filter fields and the 64-byte table at `+25` are
-described structurally only; no public or private causal save has tied them
-to a control. Sample byte `+4` is 8 or 16. In older private files it tracks
-bit depth, but freshly authored 0.81 saves always store 8.
+knob 0. Settings offsets `+126` (`ext_synth_mode`), `+127` (`vsti_device`), and
+`+149` (`vsti_device_enabled` in IDs 4–6) hold the extended instrument editor's
+VSTi routing state. Private causal saves change `+127` (device 01 -> 02) and
+`+149` (enable light off/on) in isolation. `+126` is named by correlation only:
+it is 1 in every VSTi-linked instrument and 0 elsewhere, but no causal save has
+changed it. The public 0.81 VSTi fixtures store `+149 = 0` although linked,
+which is not yet explained. The probable filter fields (`+89..+125`) and the 64-byte
+table at `+25` are described structurally only; no public or private causal
+save has tied them to a control. Sample byte `+4` is 8 or 16. In older private
+files it tracks bit depth, but freshly authored 0.81 saves always store 8.
+
+Every instrument record contains 32 nested `tag = 2` sub-chunks (`id = 2` in
+IDs 3/4, `id = 3` in IDs 5/6) forming a single `8 × 4` variable-length envelope
+grid (`row ∈ 0..7` steps `A..H` × `col ∈ 1..4`). Unedited slots have 5 default
+points (`29` bytes in IDs 3/4, `30` bytes in IDs 5/6), while edited slots across
+all rows and columns use the same variable-length point and sustain/loop layout.
 
 Framed keymap entries are read as flag, layer count, and 4-byte layers. The
 count interpretation is a conjecture, so unexpected layer bytes are preserved
@@ -112,19 +127,20 @@ For Ogg, `stored_value_count` equals final granule position × channels in all
 private Ogg samples (1032/1032) and in the public Ogg fixtures.
 
 Fadeout at keymap end `+0` matches the instrument fadeout of Skale's own XM
-export for every paired private file: 16/16 instruments with 928-byte prefixes
-and 11/11 with 1056-byte prefixes. No paired export exists for record IDs 3–5,
-so for those versions the field rests on the common settings prefix being
-byte-identical across a private 0.75 song and its 0.81 resave.
+export for every paired private file: 87/87 instruments in a paired 0.75 (ID 3)
+export, 16/16 instruments with 928-byte (ID 6) prefixes, and 11/11 with
+1056-byte (ID 6) prefixes (114/114 total).
 
 ## 4. FX chain and VSTi state
 
 Rights-safe 0.76 mda Delay and 0.81 mda JX10 causal families now cover FX
 parameter, mixer-volume, bypass, synth linkage, pattern-note, and VSTi
 parameter changes. They establish zero-based stored slot indices for the
-one-based UI slots, an explicit VSTi plugin-parameter count, and the boundary
-at which the still-opaque Skale-owned synth routing/send tail begins. The
-plugin DLLs were authoring tools only and are not distributed.
+one-based UI slots, an explicit VSTi plugin-parameter count, and a fixed
+110-byte Skale-owned per-synth mixer strip (`skale_state`: 1 leading zero byte,
+16 six-byte send-knob records, `f32 bal`, `f32 volume_fader`, `u8
+sub_assign[4]`, and `u8 mute_or_toggle`). The plugin DLLs were authoring tools
+only and are not distributed.
 
 ## 5. Global mixer
 
@@ -136,8 +152,9 @@ the observed four-byte form.
 
 The public compressed-field matrix covers all 31 non-empty presence masks. A
 literal event fixture establishes the second grammar, and an authentic
-application-side check confirms note value `0x81` as Note Off. Value `0x80`
-remains unidentified.
+application-side check confirms note value `0x81` as Note Off. Under the
+two-mode grammar, `note == 0x80` has zero occurrences across all private and
+public fixtures.
 
 ## 7. Version and prefix compatibility
 
@@ -150,8 +167,17 @@ use distinct instrument-prefix lengths. Compatibility probes show that older
 applications may warn and discard instruments when encountering later
 structures.
 
+### Verification follow-up (2026-10-19)
+
+Corpus verification now fails with an instrument-specific diagnostic for an
+inexact envelope grid, rather than merely reporting a failed coverage count.
+The Kaitai synth record requires the fixed 110-byte mixer strip to exhaust its
+bounded record; additional bytes no longer go unread. Regression tests mutate
+authentic safe fixture copies to check missing/duplicate/reordered envelopes
+and short/long synth records. These are consumer tests, not application evidence.
+
 ## 8. Remaining questions
 
 The open-question list in `FORMAT.md` is authoritative. In particular, text
-encoding, pattern note `0x80`, some volume/effect forms, several instrument
-regions, and general plugin-owned data remain incomplete.
+encoding, some volume/effect forms, several instrument regions, and general
+plugin-owned data remain incomplete.

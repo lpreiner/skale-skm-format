@@ -132,11 +132,12 @@ starting and ending absolute row positions. Event rows use two grammars:
   note, instrument, two-byte volume, and parameter fields.
 
 Trailing empty pattern rows are not encoded and must be padded by the consumer
-to the declared pattern length. Note value `0x81` is Note Off. The distinct
-value `0x80` remains unidentified. “Note Death: Cut / Note Off” in the extended
+to the declared pattern length. Note value `0x81` is Note Off. Under the
+verified two-mode row grammar, every decoded note byte across the corpus is in
+`0..95` or `0x81` (earlier reports of `0x80` note values came from a
+pre-two-mode parser artifact). “Note Death: Cut / Note Off” in the extended
 instrument editor is an instrument-level end-of-note policy and does not by
-itself establish a pattern-row encoding for Note Cut. Do not label note value
-`0x80` as Note Cut without a causal pattern save/diff.
+itself establish a pattern-row encoding for Note Cut.
 
 The public synthetic compressed-mask, literal-row, and Note Off fixtures all
 load in Skale 0.76 without a new-chunk warning or visible pattern corruption.
@@ -183,7 +184,14 @@ rejected rather than scanned for an alternative start. The fallback alone
 cannot resolve intentionally constructed ambiguous nested-list decoys.
 
 Sample-less ID 3/4 instruments can start their nested list with `(id=2, tag=2)`
-parameter/envelope chunks. ID 5/6 use `(id=3, tag=2)`. Both families are supported.
+parameter/envelope chunks. ID 5/6 use `(id=3, tag=2)`. Both families are
+supported. Every instrument record contains 32 `tag=2` nested sub-chunks ordered
+as an `8 × 4` grid (`row ∈ 0..7` for steps `A..H` × `col ∈ 1..4`, where `1` is
+volume, `2` is panning, and `3..4` are two additional instrument envelopes).
+Each `tag=2` sub-chunk uses the same variable-length layout: `u8 row`, `u8 col`,
+`u8 enabled`, `u8 num_points`, `(u16 x, u16 y)[num_points]`,
+`u8 sustain_enabled`, `u8 sustain_point`, `u8 loop_enabled`, `u8 loop_start`,
+`u8 loop_end`, plus one trailing zero byte when `id == 3`.
 
 In a backward-compatibility test, Skale 0.76 loads its own controlled keymap
 fixture without a warning but reports “NEW Chunks Found” for each controlled
@@ -218,18 +226,23 @@ these fields four bytes out of alignment.
 
 The first 130 settings bytes are shared by IDs 3–6. After the fields above,
 `+25..88` is a 64-byte table that is the identity map in nearly every record,
-and `+89..127` holds flags and floats. These are probably the instrument
+and `+89..125` holds flags and floats. These are probably the instrument
 filter (defaults 5000, 5000, 50, 0.5, 0.5, 0, 10; a 3-bit mask at `+122`), but
-no UI control has been tied to them yet.
+no UI control has been tied to them yet. `+126` (`ext_synth_mode`; named by
+correlation only, as it is 1 exactly on VSTi-linked instruments) and `+127`
+(`vsti_device`, 0-based Section 6 synth slot index) store the extended
+instrument editor's VSTi routing linkage, with the device enable flag at `+149`
+(`vsti_device_enabled`) in IDs 4–6.
 
 Each block ends its common part with 16 FX-send knob records. IDs 4–6 store
-them at `+156` as 6 bytes each (`u8 flag, f32 value, u8 index`). ID 3 stores
+them at `+156` as 6 bytes each (`u8 flag, f32 value, u8 index`), followed at
+`+252` by `toggle01_companion` (`1 - toggle01` across all observed ID 4–6
+records). ID 3 stores
 them at `+139` as 13 bytes each (`u8 flag, f32 value, f32 0.0, f32 1.0`). ID 3
 also has a mostly-zero 54-byte tail. Knob 0 is the mixer's first send knob;
-knobs 8–15 have no visible control. The historical `toggle01_companion` at
-`+152` is preserved as a raw value: it is not universally boolean. The
-remaining constant bytes (`+132..147` all `0xFF`, `0x7F` at `+155`) are
-unidentified.
+knobs 8–15 have no visible control. The byte at `+152` (`byte_152`, formerly
+mis-anchored as `toggle01_companion`) and the remaining constant bytes
+(`+132..147` all `0xFF`, `0x7F` at `+155`) are unidentified.
 Structural correspondence across layouts does not independently establish
 UI semantics for every field; controlled evidence is distinguished in provenance.
 
@@ -306,7 +319,7 @@ The principal record shapes and editable fields were established by controlled
 single-variable saves. Consumers without an equivalent routing graph may
 preserve or report these values without reproducing playback routing.
 
-## Section 6: VSTi/plugin state — partial
+## Section 6: VSTi/plugin state — Verified for observed VSTi layout
 
 The section is an empty nested list in most files. A clean Skale 0.81 mda JX10
 family (whose common file header still says 7600) establishes that UI synth
@@ -314,9 +327,15 @@ slot 01 is stored as index 0. After the path and display-name strings, the
 record begins with an explicit `u32` plugin-parameter count followed by
 exactly that many `f32` plugin parameters. Changing JX10's
 second parameter, OSC Tune, from `-7` to `-24` changed parameter index 1 from
-approximately `0.37` to `0.0`. The remaining entry bytes contain Skale-owned
-routing/send state; preserve them as bounded opaque data until their internal
-layout is generalized.
+approximately `0.37` to `0.0`. The remaining 110 entry bytes form Skale's
+per-synth mixer strip (`skale_state`): one leading zero byte (`+0`), 16
+six-byte send-knob records (`u8 flag, f32 value, u8 pad` at `+1..+96`), `f32
+bal` (`+97..+100`, default `0.0`), `f32 volume_fader` (`+101..+104`, default
+`1.0`), `u8 sub_assign[4]` (`+105..+108`), and `u8 mute_or_toggle` (`+109`).
+The fixed strip must exhaust the synth record. Kaitai rejects shorter strips
+or additional trailing bytes; Python preserves raw state for inspection and
+reports nonexact strips as failures during corpus verification.
+
 
 As a controlled compatibility experiment, Skale 0.75 reports “New Chunks
 Found” when loading the empty 0.76 fixture. Single-change derivatives establish
@@ -343,12 +362,12 @@ A robust consumer should at minimum:
 
 - Non-ASCII text encoding.
 - Meaning of the second byte in non-plain volume-column forms.
-- Note value `0x80` and several Skale-native effects.
+- Several Skale-native pattern effects.
 - The sample metadata byte at offset 4 (8 or 16; tracks bit depth only in older files).
-- UI meaning of the probable filter fields, the 64-byte table, and the
-  constant settings bytes.
+- UI meaning of the probable filter fields, the 64-byte table, `byte_152`, and
+  the constant settings bytes.
+- Semantic roles of envelope grid columns 3 and 4 (`col ∈ {3, 4}`).
 - Whether framed keymap entries can hold more than one layer.
 - How Skale loads a stored pattern row count of `0` (never written by Skale).
 - Whether Skale plays anything for an unmapped framed keymap entry.
 - Extended MIDI/remapping state.
-- Internal layout of the Skale-owned routing/send tail in section 6.

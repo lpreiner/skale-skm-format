@@ -723,11 +723,67 @@ def parse_sample_subchunk(rec):
     return out
 
 
+ENVELOPE_STEPS = ("A", "B", "C", "D", "E", "F", "G", "H")
+ENVELOPE_TYPES = {
+    1: "volume",
+    2: "panning",
+    3: "col3",
+    4: "col4",
+}
+
+
+def parse_envelope_subchunk(rec):
+    """Decode one nested (id=2/3, tag=2) instrument envelope sub-chunk.
+
+    Every instrument record across all versions carries 32 such sub-chunks
+    forming an 8x4 grid: row 0..7 (steps A..H) x col 1..4 (volume, panning,
+    and two additional envelopes). All 32 use the same variable-length point
+    layout: `9 + 4*num_points` bytes for `id=2` (record versions 3/4) and
+    `10 + 4*num_points` bytes for `id=3` (record versions 5/6).
+    """
+    d = rec.data
+    if rec.tag != 2 or rec.id not in (2, 3) or len(d) < 9:
+        return None
+    row, col, enabled, count = d[0], d[1], d[2], d[3]
+    expected_len = (9 if rec.id == 2 else 10) + 4 * count
+    if (row not in range(8) or col not in (1, 2, 3, 4)
+            or enabled not in (0, 1) or count > 12
+            or len(d) != expected_len):
+        return None
+    points = [struct.unpack_from("<HH", d, 4 + 4 * i) for i in range(count)]
+    if (any(y > 64 for _, y in points)
+            or any(points[i][0] > points[i + 1][0]
+                   for i in range(len(points) - 1))):
+        return None
+    tail = 4 + 4 * count
+    sustain_enabled, sustain_point, loop_enabled, loop_start, loop_end = d[tail:tail + 5]
+    reserved = d[tail + 5] if rec.id == 3 else 0
+    if (sustain_enabled not in (0, 1) or loop_enabled not in (0, 1)
+            or reserved != 0
+            or (sustain_enabled and sustain_point >= count)
+            or (loop_enabled and (loop_start >= count or loop_end >= count
+                                  or loop_start > loop_end))):
+        return None
+    return {
+        "row": row,
+        "step": ENVELOPE_STEPS[row],
+        "col": col,
+        "type": ENVELOPE_TYPES[col],
+        "enabled": bool(enabled),
+        "points": points,
+        "sustain_enabled": bool(sustain_enabled),
+        "sustain_point": sustain_point,
+        "loop_enabled": bool(loop_enabled),
+        "loop_start": loop_start,
+        "loop_end": loop_end,
+        "reserved": reserved,
+    }
+
+
 def parse_instrument_envelope(rec):
     """Decode a main (step A) volume/panning envelope parameter record.
 
-    The id=3/tag=2 family also stores the fixed B-H preset grid. Main
-    envelopes are row 0, type 1 (volume) or 2 (panning), and have a
+    Main envelopes are row 0, type 1 (volume) or 2 (panning), and have a
     self-describing variable point count. Returns None for other records or
     for malformed envelope state.
     """
@@ -895,7 +951,7 @@ def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
     def eq_band(off):
         return {"enabled_flag": flag(off), "gain": f32(off + 1),
                 "freq": f32(off + 5)}
-    flags = [flag(7)] + [flag(o) for o in range(253, 257)]
+    flags = [flag(7), flag(252)] + [flag(o) for o in range(253, 257)]
     flags += [flag(o) for o in (257, 266, 275)]
     if any(v not in (0, 1) for v in flags):
         return None
@@ -905,9 +961,11 @@ def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
     out = {
         "layout": "direct-412" if record_version == 4 else "framed",
         "toggle01": flag(7),
-        # Preserve the historical name, but this is not universally boolean:
-        # VANGard instrument 1 stores 12 at this offset.
-        "toggle01_companion": flag(152),
+        # Verified at settings[252] (sample_list_start - 36 in ID 6) via
+        # singlevar/60_instrument_toggles.skm; earlier notes had a 1-digit
+        # typo (-136 -> settings[152]). Across all 1325 corpus/authoring
+        # records in IDs 4-6, flag(252) == 1 - flag(7).
+        "toggle01_companion": flag(252),
         "volume_fader": volume, "bal": bal,
         "sub_assign": [flag(o) for o in range(253, 257)],
         "eq_l": eq_band(257), "eq_m": eq_band(266), "eq_h": eq_band(275),
@@ -925,7 +983,8 @@ def parse_settings_block(settings, record_version):
     send knobs are 13-byte records in ID 3 (flag, f32 value, f32 0.0,
     f32 1.0) and 6-byte records in IDs 4-6 (flag, f32 value, u8 index);
     flag/value agree 1392/1392 across a 0.75 file and its 0.81 resave.
-    Fields whose UI meaning is not established are named by offset only.
+    Offsets 126-127 and (in IDs 4-6) 149 are the Instr. Ed. Ext. VSTi
+    linkage fields causally verified by singlevar/37, 45, 46, and 47.
     """
     f32 = lambda off: struct.unpack_from("<f", settings, off)[0]
     if record_version == 3:
@@ -936,11 +995,16 @@ def parse_settings_block(settings, record_version):
         knobs = [{"flag": settings[o], "value": f32(o + 1),
                   "index": settings[o + 5]}
                  for o in range(156, 156 + 16 * 6, 6)]
-    return {
+    out = {
         "send_knobs": knobs,
         # Identity (entry i == i) in 1777/1793 corpus records; the only
         # deviations remap entry 7 to 16 or 17. Meaning unidentified.
         "table_25": list(settings[25:89]),
+        # Instr. Ed. Ext. VSTi linkage (PROVENANCE.md §5.6.10, §5.7.1, §5.16):
+        # settings[126] = 1 when Synth mode is selected (0 otherwise);
+        # settings[127] = 0-based Section 6 synth slot index (Device 01 -> 0).
+        "ext_synth_mode": settings[126],
+        "vsti_device": settings[127],
         # Probable instrument-filter block (Conjecture): defaults
         # 5000/5000/50/0.5/0.5/0/10, edited values in steps of 1/42.
         "unidentified": {
@@ -951,6 +1015,14 @@ def parse_settings_block(settings, record_version):
             "u8_127": settings[127],
         },
     }
+    if record_version == 3:
+        out["legacy_byte_130"] = settings[130]
+        out["legacy_byte_138"] = settings[138]
+    else:
+        out["vsti_device_enabled"] = settings[149]
+        out["byte_152"] = settings[152]
+        out["byte_155"] = settings[155]
+    return out
 
 
 def instrument_prefix(data, name_end, record_version):
@@ -1066,13 +1138,19 @@ def parse_instruments(chunk, version_raw=None):
                                       base=rec.offset + HDR.size + start)
                 samples = []
                 envelopes = {}
+                envelope_grid = []
                 other_subchunks = 0
+                non_sample_subchunks = 0
                 for s in sub:
                     if s.tag == TAG_EOF:
                         continue
                     if s.id == 1 and s.tag == 1:
                         samples.append(parse_sample_subchunk(s))
                     else:
+                        non_sample_subchunks += 1
+                        grid_env = parse_envelope_subchunk(s)
+                        if grid_env is not None:
+                            envelope_grid.append(grid_env)
                         envelope = (parse_instrument_envelope(s)
                                     if s.id in (2, 3) and s.tag == 2 else None)
                         if envelope is not None:
@@ -1081,6 +1159,13 @@ def parse_instruments(chunk, version_raw=None):
                             other_subchunks += 1
                 entry["samples"] = samples
                 entry["envelopes"] = envelopes
+                entry["envelope_grid"] = envelope_grid
+                entry["envelope_grid_exact"] = (
+                    len(envelope_grid) == 32
+                    and non_sample_subchunks == 32
+                    and [(e["row"], e["col"]) for e in envelope_grid]
+                    == [(r, c) for r in range(8) for c in range(1, 5)]
+                )
                 entry["other_subchunks"] = other_subchunks
         else:
             entry["internals_located"] = False
@@ -1154,6 +1239,49 @@ def parse_fx_chain(chunk):
     return {"bytes_consumed": consumed, "slots": slots, "plugins": dlls}
 
 
+def parse_vsti_skale_state(raw):
+    """Decode the fixed 110-byte Skale-owned per-synth mixer strip in Section 6.
+
+    Layout (PROVENANCE.md §5.7.2 & §5.16, Verified across 29/29 workspace
+    records spanning Albino, Vanguard, Trionic, oxid, and mdaJX10):
+        offset 0       u8    unknown_0 (always 0)
+        offset 1..96   16x   send_knob (u8 flag, f32 value, u8 pad)
+        offset 97..100 f32   bal (zero-centered in [-0.5, +0.5], default 0.0)
+        offset 101..104 f32  volume_fader (default 1.0)
+        offset 105..108 u8[4] sub_assign (SUB1..SUB4 routing flags in {0, 1})
+        offset 109     u8    mute_or_toggle (in {0, 1}, default 0)
+    """
+    if len(raw) != 110:
+        return None
+    unknown_0 = raw[0]
+    knobs = []
+    for i in range(16):
+        off = 1 + 6 * i
+        flag = raw[off]
+        val = struct.unpack_from("<f", raw, off + 1)[0]
+        pad = raw[off + 5]
+        if flag not in (0, 1) or pad != 0 or not math.isfinite(val):
+            return None
+        knobs.append({"flag": flag, "value": val, "pad": pad})
+    bal, volume_fader = struct.unpack_from("<ff", raw, 97)
+    sub_assign = list(raw[105:109])
+    mute_or_toggle = raw[109]
+    if (unknown_0 != 0
+            or not math.isfinite(bal) or not -0.5 <= bal <= 0.5
+            or not math.isfinite(volume_fader) or volume_fader < 0
+            or any(b not in (0, 1) for b in sub_assign)
+            or mute_or_toggle not in (0, 1)):
+        return None
+    return {
+        "unknown_0": unknown_0,
+        "send_knobs": knobs,
+        "bal": bal,
+        "volume_fader": volume_fader,
+        "sub_assign": sub_assign,
+        "mute_or_toggle": mute_or_toggle,
+    }
+
+
 def parse_section6(chunk):
     """
     Section 6 holds per-instrument VSTi data when populated -- see
@@ -1163,10 +1291,8 @@ def parse_section6(chunk):
     A populated record shares section 4's slot_index/path/display_name
     header shape. A clean Skale 0.81 mdaJX10 causal family establishes an
     explicit u32 plugin-parameter count followed immediately by exactly that
-    many plugin parameter floats. The remaining bytes are
-    Skale-owned per-synth routing/send state whose internal boundary is still
-    under investigation, so they remain raw rather than being mislabeled as
-    plugin parameters.
+    many plugin parameter floats, and a fixed 110-byte Skale-owned per-synth
+    mixer strip (`skale_state`, PROVENANCE.md §5.16).
     """
     recs, consumed = read_chunks(chunk.data, base=chunk.offset + HDR.size)
     entries = []
@@ -1192,9 +1318,13 @@ def parse_section6(chunk):
                 if param_count <= 65536 and params_end <= len(trailing):
                     params = list(struct.unpack_from(
                         f"<{param_count}f", trailing, 4))
+                    skale_state_raw = trailing[params_end:]
+                    skale_state = parse_vsti_skale_state(skale_state_raw)
                     entry["plugin_param_count"] = param_count
                     entry["plugin_params"] = params
-                    entry["skale_state_raw"] = trailing[params_end:]
+                    entry["skale_state_raw"] = skale_state_raw
+                    entry["skale_state"] = skale_state
+                    entry["skale_state_exact"] = skale_state is not None
                     entry["structured_prefix_exact"] = True
             entries.append(entry)
         except IndexError as exc:
@@ -1499,13 +1629,14 @@ def verify_corpus(root):
     fully_covered = 0
     trailer_checks = {"channel_match": 0, "version_match": 0, "reserved_zero": 0, "total": 0}
     fx_slots_total = fx_slots_exact = 0
-    s6_entries_total = s6_entries_in_range = 0
+    s6_entries_total = s6_entries_in_range = s6_skale_state_exact = 0
     tracks_total = tracks_clean = 0
     pattern_sections_total = pattern_sections_exact = 0
     patterns_total = patterns_rows_nonzero = 0
     tracks_row_offset_consistent = 0
     row_overflow = []
     instruments_total = instruments_located = 0
+    envelope_grids_total = envelope_grids_exact = 0
     mixer_strip_total = mixer_strip_sane = 0
     samples_total = samples_size_exact = 0
     samples_extract_total = samples_extract_ok = 0
@@ -1552,6 +1683,11 @@ def verify_corpus(root):
             s6_entries_total += 1
             if all(0.0 <= p <= 1.0 for p in e["plugin_params"]):
                 s6_entries_in_range += 1
+            if e.get("skale_state_exact"):
+                s6_skale_state_exact += 1
+            else:
+                hard_failures.append((f, f"section-6 slot {e.get('slot_index')} "
+                                      "skale_state_raw is not a valid 110-byte strip"))
 
         if p:
             pattern_sections_total += 1
@@ -1616,6 +1752,12 @@ def verify_corpus(root):
             instruments_total += 1
             if rec["internals_located"]:
                 instruments_located += 1
+                envelope_grids_total += 1
+                if rec.get("envelope_grid_exact"):
+                    envelope_grids_exact += 1
+                else:
+                    hard_failures.append((f, f"instrument {rec.get('index')} "
+                                          "envelope grid is not an exact 8x4 grid"))
             if "mixer_strip" in rec and h.get("version_raw") == 7600:
                 mixer_strip_total += 1
                 if rec["mixer_strip"] is not None:
@@ -1670,6 +1812,8 @@ def verify_corpus(root):
     print(f"  section 6 plugin params    : {pct(s6_entries_in_range, s6_entries_total)}  "
           f"<- counted prefixes recognized; [0,1] range is informational "
           f"and plugin-specific")
+    print(f"  section 6 skale_state     : {pct(s6_skale_state_exact, s6_entries_total)}  "
+          f"<- must be 100% (§5.16, Verified: fixed 110-byte synth mixer strip)")
     print()
     print(f"  pattern chunk lists exact : {pct(pattern_sections_exact, pattern_sections_total)}  "
           f"<- must be 100% (§5.15): pattern chunks + track mini-chunks + EOF, "
@@ -1689,6 +1833,9 @@ def verify_corpus(root):
             print(f"      {f}: pattern {idx} channel {ch}")
     print(f"  instrument internals loc. : {pct(instruments_located, instruments_total)}  "
           f"<- record-version layouts include sample-less text/credit slots")
+    print(f"  instrument 8x4 env grids  : {pct(envelope_grids_exact, envelope_grids_total)}  "
+          f"<- must be 100% (§5.16, Verified: 32 variable-length A..H x 1..4 "
+          f"sub-chunks per instrument)")
     print(f"  mixer_strip sane (0.76)   : {pct(mixer_strip_sane, mixer_strip_total)}  "
           f"<- versioned 284/288-byte strips; unknown fields remain raw")
     print(f"  sample header+audio exact : {pct(samples_size_exact, samples_total)}  "

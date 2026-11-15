@@ -1,69 +1,35 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-2-Clause
 """
-skmparse.py -- independent reference parser for Skale Tracker .SKM modules.
+skmparse.py -- reference parser for Skale Tracker .skm modules.
 
-The format was investigated with Skale application versions 0.70, 0.71,
-0.75, 0.76, 0.80, 0.802, and 0.81. The later three applications still write
-7600 in the SKM header but use distinguishable instrument-prefix layouts, so
-the serialized version stamp is not a sufficient layout discriminator.
-No official specification is known. The implementation distinguishes
-controlled/corpus-wide findings from fields that remain provisional or raw;
-see FORMAT.md and PROVENANCE.md in the public repository.
+Tested against files written by Skale 0.70, 0.71, 0.75, 0.76, 0.80, 0.802,
+and 0.81. The header version is not enough to select a layout: 0.80, 0.802,
+and 0.81 all write 7600. See FORMAT.md for the format and PROVENANCE.md for
+the evidence.
 
-CONTAINER
----------
-The whole file is a flat sequence of chunks:
+A file is a sequence of chunks, each with an 8-byte header:
 
-    uint16  id      0x0001 = binary section, 0x0003 = record/text section
-    uint16  tag     0xFFFE = file header, 1..N = section index,
-                    0xFFFF = end-of-file terminator (length 0)
-    uint32  length
-    uint8   payload[length]
+    u16  id
+    u16  tag     0xFFFE = file header, 1..6 = section, 0xFFFF = end of list
+    u32  length
+    u8   payload[length]
 
-Chunks nest: section 3 (instruments) contains child chunks using the
-identical 8-byte header, so a single recursive reader handles the file.
+Sections, by tag:
 
-TOP-LEVEL SECTIONS OBSERVED
----------------------------
-    0xFFFE  9 bytes: magic "ALIM3" + uint32 version (version * 10000,
-            e.g. 7100 -> Skale 0.71)
-    1       song title + free-text message + tempo/speed/channel/version trailer
-    2       order list (pattern sequence) followed by pattern data
-    3       instrument records
-    4       VST / effect chain (embedded DLL paths)
-    5       global/mixer: master volume, SUB1-4 bus data (fader/balance/
-            4 send knobs each), FX-bus cross-send matrix (verified
-            by controlled changes; see PROVENANCE.md §5)
-    6       VSTi slots: plugin identity, counted parameter prefix, and a
-            bounded Skale-owned routing/send tail
-    0xFFFF  terminator
+    0xFFFE  "ALIM3" + u32 version (version x 10000)
+    1       title, message, and initial BPM/speed/channels
+    2       order list and patterns
+    3       instruments and samples
+    4       VST FX chain
+    5       master volume, SUB1-4 buses, FX-bus sends
+    6       VSTi synths
+    0xFFFF  end
 
-STILL UNDECODED
----------------
-    * pattern-row byte consumption is 100% exact corpus-wide as of
-      2026-08-08 (decode_events(), see PROVENANCE.md §6); still open:
-      non-plain volume-column forms, native effect commands 0x10..0x13,
-      note value 0x80, and a few pattern-record fields. Track
-      reserved/last_row values are implemented as absolute row bounds.
-    * sample audio header (format/frames/channels/audio_data_length) is
-      decoded and corpus-wide validated as of 2026-08-08 (§3.1); the raw
-      PCM/Ogg bytes are now also extracted into real sample data
-      (extract_pcm_samples/extract_ogg_stream/export_sample, --extract-samples
-      CLI flag), corpus-wide exactly located/extracted, and cross-checked against an
-      independent decoder (ffmpeg/ffprobe) and the known-content WAV ground
-      truth. The metadata byte at +4 remains unexplained. The former
-      unknown u16 and audio tails are inner chunk tag/EOF framing (2026-10-19). SKM raw PCM has no explicit Hertz field; export uses the
-      verified XM-compatible relative-note/finetune conversion unless the
-      caller supplies an override. Ogg is self-describing.
-    * section 6's VSTi prefix (PROVENANCE.md §4) contains an
-      explicit u32 parameter count followed by that many f32 plugin
-      parameters. A controlled mda JX10 change maps plugin parameter index 1
-      (OSC Tune) from approximately 0.37 to 0.0. The following Skale-owned
-      routing/send tail remains bounded raw data. Section 4's observed VST2
-      FX record layout is fully decoded; see parse_fx_chain.
-Controlled Skale 0.81 saves establish embedded Ogg Vorbis sample storage
-(look for "OggS"). No earlier tested application produced an Ogg fixture.
+Not decoded: non-plain volume-column bytes, the stored scaling of effects
+0x10-0x13, sample metadata byte 4, and several instrument settings fields
+(see EXAMPLES_NEEDED.md). Raw PCM has no sample-rate field; export derives
+one from relative note and finetune unless the caller supplies a rate.
 """
 
 import argparse
@@ -75,9 +41,7 @@ import sys
 from pathlib import Path
 
 def _json_default(obj):
-    """json.dump(default=...) hook: raw bytes (e.g. a 2-byte volume cell in
-    decode_events, or section6's trailing/Skale-state fields) become a
-    hex string rather than raising TypeError."""
+    """json.dump hook: write raw bytes as a hex string."""
     if isinstance(obj, (bytes, bytearray)):
         return obj.hex()
     raise TypeError(f"not JSON serializable: {type(obj).__name__}")
@@ -157,26 +121,19 @@ def parse_header(chunk):
 
 def parse_song_text(chunk):
     """
-    Parse the tag-1 song-text section.
+    Parse section 1 (song text).
 
-    Only the final 8 bytes are a fixed field (the timing/version trailer).
-    Everything before it is the title, an optional NUL separator, the
-    free-text message, and a variable-length run of NUL padding.
+    Only the last 8 bytes (the timing/version trailer) are a fixed field.
+    Before them are the title, an optional NUL separator, the message, and
+    NUL padding.
 
-    The 10-byte zero footer is real and fixed-width for Skale-emitted
-    files (PROVENANCE.md section 1). It is not sliced off separately
-    here, because reserving 10 bytes unconditionally truncates the
-    message of any file whose trailing NUL run is shorter -- true of the
-    hand-authored probe fixtures 42 and 43, whose messages previously
-    lost their final character. Taking the message up to the trailer and
-    NUL-stripping is correct for both. Observed trailing-run lengths:
-    9 (2 hand-authored), 10 (47), 11 (1), 12 (121); a run of 10 or more
-    is what the fixed footer predicts. `zero_footer_raw` still reports
-    the last 10 padding bytes.
+    Skale writes a ten-byte zero footer before the trailer, but some valid
+    files have a shorter NUL run, so the message is taken up to the
+    trailer and NUL-stripped rather than reserving the footer.
+    `zero_footer_raw` reports the ten bytes before the trailer when they
+    exist.
     """
-    # Only the 8-byte trailer is a fixed field; a well-formed section also
-    # needs at least the title's NUL terminator ahead of it. The old minimum
-    # of 18 reserved the 10-byte footer, which is no longer sliced off here.
+    # Minimum: the title's NUL terminator plus the 8-byte trailer.
     if len(chunk.data) < 9:
         raise ValueError(
             "song text chunk is too short for a terminated title and its "
@@ -211,104 +168,54 @@ def parse_song_text(chunk):
 
 
 # Section 2 pattern records are ordinary (id=1, tag=1, u32 length) chunks
-# in a chunk list closed by EOF (PROVENANCE.md §5.15). The historical
-# "signature" is just that header's id/tag half.
+# in a chunk list closed by EOF. PATTERN_SIG is that header's id/tag half.
 PATTERN_SIG = b"\x01\x00\x01\x00"
 # Tracks inside a pattern use a half-width chunk header:
 # u8 id (=1), u8 tag (1 = track, 0xFF = end), u16 length.
 TRACK_HDR = struct.Struct("<BBH")
 TRACK_TAG = 1
 TRACK_TAG_END = 0xFF
-TRACK_SEP = b"\x01\x01"  # historical name for a track header's id/tag half
+TRACK_SEP = b"\x01\x01"  # a track header's id/tag half
 
-# Special `note` field values, outside the normal 0..~95 pitch range.
-# NOTE_OFF verified 2026-08-05: entering Note Off via Caps (per keyb.html)
-# on an existing note produced exactly this byte, and the paired .xm export
-# shows XM's own standard note=97 key-off at the same cell. Stable under a
-# second test that added a volume value to the same release row (see
-# PROVENANCE.md §6) -- the marker does not change when combined with
-# other fields. NOTE_CUT is only a legacy API label for an unidentified rarer
-# sibling value (315 occurrences vs. NOTE_OFF's 9,932 across the corpus) that
-# co-occurs with a volume byte 99% of the time. The Instr. Ed. Ext. screen's
-# instrument-level NOTE DEATH policy is not evidence for a pattern-row value,
-# and no pattern-editor keybinding for Note Cut was found in keyb.html.
+# Special note values. 0x81 is Note Off (XM key-off in the paired export).
+# NOTE_CUT is kept for API compatibility only: 0x80 does not occur as a note
+# under the current row grammar, and nothing shows it means Note Cut.
 NOTE_OFF = 0x81
 NOTE_CUT = 0x80  # unidentified; do not expose as verified Note Cut semantics
 
 
-# bit position (ascending) -> payload byte width, for a set bit in a
-# COMPRESSED (bit7-set) row token. Confirmed by controlled single-variable
-# edits and now covered by the public compressed-field-matrix and literal-row
-# fixtures, with paired XM exports as an independent cross-check.
+# Compressed row token: marker bit -> field width in bytes. Fields follow
+# in ascending bit order.
 ROW_FIELD_WIDTH = {0: 1, 1: 1, 2: 1, 3: 2, 4: 1}
 ROW_FIELD_NAME = {
     0: "effect_cmd",    # 1 byte
     1: "note",          # 1 byte, XM note number minus 1
     2: "instrument",    # 1 byte
-    3: "volume",        # 2 bytes -- meaning of the 2nd byte is still open
+    3: "volume",        # 2 bytes; second byte 00 = plain, 80 = none
     4: "effect_param",  # 1 byte
 }
 
 
 def decode_events(data, offset, length):
     """
-    Decode one track's events[] into per-row cell values.
+    Decode one track's events into per-row values.
 
-        u8   last_row   -- likely the absolute ending row (see below)
-        u8   reserved   -- likely the absolute starting row (see below)
-        row_token[]     -- one token per row from the start row onward;
-                           trailing all-empty rows are simply never encoded
+        u8   last_row   absolute last stored row
+        u8   reserved   absolute first stored row
+        row_token[]     one per row from `reserved` to `last_row`
 
-    Two row-token grammars, selected by bit7 -- confirmed 2026-08-08 by a
-    live cross-check against a paired .xm export (see PROVENANCE.md §6):
+    Each row token starts with a marker byte:
 
-    - `0x80` exactly: empty row (1 byte, no payload).
-    - bit7 SET otherwise: COMPRESSED row. The low 5 bits select which
-      fields follow, in ascending bit order -- see ROW_FIELD_WIDTH/
-      ROW_FIELD_NAME above. Every selected field consumes its documented
-      width independently; EFFECT PARAM (bit4) always consumes one byte.
-    - bit7 CLEAR (any byte other than 0x80): LITERAL row. The byte itself
-      IS the effect command value (not a bitmask), unconditionally
-      followed by note (1 byte), instrument (1 byte), volume (2 bytes),
-      and effect param (1 byte) -- 6 bytes total, all fields always
-      present. This mirrors XM's own packed-pattern convention (a
-      bit7-clear byte there is likewise a literal note followed by
-      mandatory instrument/volume/effect/param), just with SKM's own
-      field order and a command byte instead of a note leading it.
+    - 0x80: empty row.
+    - bit 7 set: compressed row. Bits 0-4 flag which fields follow, in
+      ascending bit order (ROW_FIELD_WIDTH / ROW_FIELD_NAME).
+    - bit 7 clear: literal row. The marker is the effect command, and note,
+      instrument, volume (2 bytes), and effect param always follow.
 
-    This two-mode grammar superseded an earlier same-day model that
-    treated every non-0x80 byte as a compressed bitmask with two
-    zero-width "flag5"/"flag6" bits tacked on for bits 5/6 (89.9% ->
-    97.3% exact-match). That model was itself real progress but wrong in
-    a deeper way: bits 5/6 were never a real field at all -- they were
-    misread fragments of literal-mode rows whose byte boundaries the old
-    single-mode walk had no way to find. See PROVENANCE.md §6's
-    2026-08-08 update for the live GUI/XM evidence.
-
-    EFFECT PARAM (bit4) always consumes a byte when its bit is set, with
-    no dependency on EFFECT COMMAND (bit0) -- an earlier "zero-width
-    unless bit0 also set" special case (2026-08-07) was a coincidental
-    overfit: an authored pattern test cross-checked against its paired XM had
-    a real param-only row that rule silently
-    dropped a byte from, desyncing every row after it in that track. This
-    two-mode grammar, with that special case removed, reaches **100%**
-    exact byte consumption across the entire corpus (see PROVENANCE.md
-    §6's 2026-08-08 update, second entry).
-
-    `last_row`/`reserved` are the pattern's absolute ending/starting row
-    for this track (PROVENANCE.md §6's 2026-08-08 finding,
-    `reserved + (rows_decoded - 1) == last_row` in 100% of tracks
-    corpus-wide) -- consumed by `parse_tracks`, which left-pads the
-    returned row list by `reserved` so row indices are absolute rather
-    than track-local. Returned here too (raw) so callers can verify the
-    relation themselves rather than trust it silently.
-
-    Returns (rows, clean, last_row, reserved): `rows` is a list with one
-    entry per decoded row (None for an empty row, else a dict of field
-    name -> raw value/bytes), in on-the-wire order starting at `reserved`
-    (NOT yet absolute-padded -- that's `parse_tracks`'s job). `clean` is
-    True iff the walk consumed exactly `length` bytes -- 100% of the
-    tracked corpus as of 2026-08-08 (see PROVENANCE.md §6).
+    Returns (rows, clean, last_row, reserved). `rows` has one entry per
+    stored row (None if empty, else a dict of raw field values), starting
+    at `reserved`; `parse_tracks` shifts them to absolute positions.
+    `clean` is True when exactly `length` bytes were consumed.
     """
     if length < 2:
         return [], False, None, None
@@ -350,28 +257,19 @@ def decode_events(data, offset, length):
 
 def parse_tracks(data, start, end):
     """
-    Pattern payload is CHANNEL-MAJOR, not a flat cell stream, framed as a
-    half-width chunk list (PROVENANCE.md §5.15, 2574/2574 records exact):
+    Parse a pattern's tracks: one per channel, as a chunk list with a
+    4-byte header.
 
-        track_chunk[]:
-            u8   id                 (always 1)
-            u8   tag                (1 = track, 0xFF = end of list)
-            u16  length             (0 for the end marker)
-            u8   channel_index      (sequential 0..channel_count-1)
-            u8   events[length-1]
+        u8   id                 always 1
+        u8   tag                1 = track, 0xFF = end of list
+        u16  length             0 for the end marker
+        u8   channel_index      0..channel_count-1, in order
+        u8   events[length-1]
 
-    The former "01 01 separator" and "01 ff 00 00 trailer" are these
-    headers' id/tag bytes and the end marker. `start` must point at the
-    first track header and `end` at the pattern chunk's end.
-
-    `rows` is absolute-indexed, not track-local: `decode_events`'s
-    on-the-wire row list is left-padded with `reserved` leading `None`s
-    (PROVENANCE.md §6) so `rows[i]` is pattern row `i`, matching what a
-    player actually needs. `row_offset_consistent` records whether
-    `reserved + (decoded_row_count - 1) == last_row` held for this track
-    (100% corpus-wide as of 2026-08-10) -- `rows` is still built
-    from `reserved` alone either way, since the padding only needs a
-    correct starting row, not an exact `last_row` match.
+    `start` is the first track header; `end` is the end of the pattern
+    chunk. Each track's `rows` is padded at the front by `reserved`, so
+    `rows[i]` is pattern row `i`. `row_offset_consistent` reports whether
+    `reserved + decoded_rows - 1 == last_row`.
     """
     off = start
     tracks = []
@@ -408,67 +306,26 @@ def parse_tracks(data, start, end):
 
 def parse_patterns(chunk):
     """
-    Section 2 layout (verified byte-exact across files authored with Skale
-    0.70, 0.71, 0.75, 0.76, 0.80, 0.802, and 0.81):
+    Parse section 2.
 
         u8    channel_count
-        u8    order_list[256]        (pattern indices; only the first
-                                       song_length bytes are real, the rest
-                                       is leftover/uninitialized, NOT
-                                       necessarily zero -- see below)
-        u8    song_length            -- Verified 2026-08-08: this is
-                                         Skale's own "SONG LENGTH" field,
-                                         not a placeholder. Confirmed by a
-                                         live edit-and-diff/reload test
-                                         (now covered by the public stale-order-byte fixture):
-                                         removing an order-list entry via
-                                         Skale's own UI left a stale,
-                                         nonzero byte past the new order
-                                         list's real end (order bytes
-                                         became [1,2,2,0,0,...] while this
-                                         field read 2) -- and reloading
-                                         that exact file in Skale itself
-                                         displays SONG LENGTH=2 and a
-                                         2-entry order list, matching this
-                                         field exactly, not the trailing
-                                         byte count.
-        u8    repeat_pattern         -- Skale UI's "REPEAT PATT." order index
-        chunk pattern[]  starting at offset 0x103, an ordinary chunk list
-                         closed by EOF (01 00 FF FF 00 00 00 00 -- the
-                         historical "8-byte section tail")
+        u8    order_list[256]   pattern IDs; entries past song_length are
+                                leftover data and may be nonzero
+        u8    song_length       Skale's SONG LENGTH
+        u8    repeat_pattern    Skale's REPEAT PATT. order position
+        chunk pattern[]         from offset 0x103, closed by EOF
 
-    Each pattern chunk (PROVENANCE.md §5.15, Verified 2026-10-19):
+    Each pattern chunk (id 1, tag 1):
 
-        u16   id = 1, u16 tag = 1, u32 length   (the historical
-              "signature 01 00 01 00 + u16 packed_size + u16 ?")
         u8    pattern_index
-        u16   rows          (Skale writes 256 as 00 01; the old "u8 rows,
-                             0 means 256" reading treated its high byte as
-                             an unknown constant)
-        track_chunk[]       (see `parse_tracks`), closed by 01 ff 00 00
-
-    The channel-major track framing and two-mode row-token grammar are
-    decoded by `parse_tracks` / `decode_events` with exact byte consumption
-    across the complete corpus. No section-2 framing bytes remain unknown.
+        u16   rows              1-256; Skale writes 256 as 00 01
+        track_chunk[]           see parse_tracks
     """
     d = chunk.data
     channels = d[0]
     order_region = d[1:257]
-    # CORRECTION 2026-08-08 (PROVENANCE.md §2): this used to be
-    # `len(order_region.rstrip(b"\x00"))`, a heuristic that is wrong in two
-    # directions -- it undercounts any order list whose real last entry is
-    # pattern 0 (silently reports "0 entries" for the extremely common
-    # single-pattern-song case, order_region all zero), and it overcounts
-    # whenever the editor leaves stale nonzero bytes past the true song
-    # length (as directly demonstrated by 50_removepattern_test.skm). The
-    # `song_length` field read below is authoritative -- verified against
-    # Skale's own reload of an edited file, not just self-consistent.
-    # This single fix also removed several false "dangling order-list"
-    # reports: files that appeared to reference a
-    # pattern index one past the last real record (diamond drop 2.alt,
-    # eastern variations, santa mario) all resolve to fully in-range order
-    # lists once `song_length` is used instead of the old heuristic --
-    # there was no real dangling reference, only an overcounted tail.
+    # Use song_length, not the count of trailing zeros: the last real entry
+    # can be pattern 0, and Skale can leave nonzero bytes past the end.
     song_length = d[257] if len(d) >= 259 else 0
     repeat_pattern = d[258] if len(d) >= 259 else 0
     used = min(song_length, len(order_region))
@@ -491,19 +348,10 @@ def parse_patterns(chunk):
         body = pc.offset + HDR.size  # offset within section 2's payload
         data_end = body + pc.length
         tracks, tracks_clean = parse_tracks(d, body + 3, data_end)
-        # `rows` is a u16 (PROVENANCE.md §5.15). Every 256-row pattern
-        # Skale wrote in the corpus stores 00 01; the older "u8 rows,
-        # stored 0 means 256" model read only the low byte. Skale refuses
-        # to grow a pattern past 256 (§5.4), and 0 is unobserved in
-        # Skale output, so it is reported as-is rather than guessed.
+        # u16 row count. Skale never writes 0; it is reported as-is.
         rows_raw = struct.unpack_from("<H", d, body + 1)[0]
         rows = rows_raw
-        # Right-pad every track to the pattern's true row count -- trailing
-        # empty rows are never encoded on the wire regardless of a
-        # pattern's real length (same §2 finding), and `parse_tracks`
-        # already left-padded each track's own list by its `reserved`
-        # starting row, so this only ever adds trailing `None`s, never
-        # truncates.
+        # Trailing empty rows are not stored; pad each track to `rows`.
         for tr in tracks:
             if len(tr["rows"]) < rows:
                 tr["rows"] = tr["rows"] + [None] * (rows - len(tr["rows"]))
@@ -513,7 +361,7 @@ def parse_patterns(chunk):
             "rows": rows,
             "rows_raw": rows_raw,
             "length": pc.length,
-            "packed_size": pc.length,  # historical alias of the chunk length
+            "packed_size": pc.length,  # alias of length, kept for compatibility
             "data_offset": body + 3,   # first track-chunk header
             "track_count": len(tracks),
             "tracks_clean": tracks_clean and len(tracks) == channels,
@@ -534,42 +382,25 @@ def parse_patterns(chunk):
         "indices_sequential": [r["index"] for r in records] == list(range(len(records))),
         "walk_clean": clean,
         "all_tracks_clean": all(r["tracks_clean"] for r in records) if records else None,
-        # Membership against the actual set of record indices, not a naive
-        # `idx < len(records)` -- some files have non-sequential pattern
-        # indices (§2 open question, `indices_sequential` above), so a
-        # reference like index 37 in a 36-record file can be a real record
-        # numbered 37 (a deleted-pattern gap elsewhere, not a dangling
-        # reference) rather than out of range. Corpus-wide as of
-        # 2026-08-08: this narrows "dangling reference" down to exactly
-        # confirmed example is newsong.skm (index 2 with only 0/1 existing);
-        # other files may likewise preserve intentionally missing IDs.
+        # Pattern IDs can have gaps, so check against the set of IDs present
+        # rather than the record count. Skale can save an order entry that
+        # names a missing pattern.
         "order_list_in_range": all(idx in {r["index"] for r in records} for idx in order),
         "trailing_bytes": len(d) - off,
         "patterns": records,
     }
 
 
-# Default search window for locate_sample_list, in bytes past `start`.
-# PROVENANCE.md §3 originally assumed the envelope-shaped region
-# between a 0.76-style 96-entry keymap and the sample-chunk list was a
-# roughly-fixed ~350 bytes; disproved 2026-08-06 (real offsets from 6 to
-# 480+ bytes observed). `parse_instruments` now always passes the whole
-# remaining record as the window (§3's 2026-08-08 update) since the
-# keymap/envelope region's size isn't just variable, it's version-
-# dependent and not needed at all once each candidate is validated against
-# §3.1's sample-size invariant. This default remains for callers that
-# want a bounded scan.
+# Default window for locate_sample_list, in bytes past `start`.
+# parse_instruments passes the whole record instead.
 SAMPLE_LIST_SEARCH_WINDOW = 4096
 
 
 LOOP_TYPES = {0: "off", 1: "forward", 2: "ping-pong"}
 
-# Audio payload format tag, PROVENANCE.md §3.1 -- corpus-wide for every
-# sample with a located header, audio_data_length == frames *
-# BYTES_PER_SAMPLE[format] + 5 holds exactly for formats 2 and 3 (the "+5"
-# tail is unexplained but a fixed constant). Format 4 (Ogg Vorbis) uses a
-# different inner layout: a u32 stream length followed by an "OggS"-magic
-# stream, so it has no fixed bytes-per-sample and isn't in this table.
+# Audio chunk id -> format. For PCM, the audio chunk length is
+# value_count * BYTES_PER_SAMPLE + 5 (the u32 count and u8 channels).
+# Ogg holds a u32 inner length and an OggS stream instead.
 SAMPLE_FORMATS = {2: "pcm16", 3: "pcm8", 4: "ogg"}
 BYTES_PER_SAMPLE = {2: 2, 3: 1}
 
@@ -598,29 +429,14 @@ def _sample_subchunk_size_exact(sd):
 
 def locate_sample_list(data, start, window=SAMPLE_LIST_SEARCH_WINDOW):
     """
-    Find the offset where an instrument record's tail becomes a
-    self-terminating id/tag/length chunk list (sample sub-chunks +
-    param_table/envelope entries, ending in the standard EOF chunk) --
-    see PROVENANCE.md §3. A structurally-parseable candidate (reads to
-    EOF with no leftover bytes) is not sufficient on its own to accept:
-    2026-08-08's version-spanning search (§3 update) found that
-    starting the scan right after the instrument name, with no envelope-
-    region size assumption, produces plenty of structurally-valid but
-    *wrong* early matches -- mostly in the mostly-zero envelope/keymap
-    region itself, which coincidentally parses as a tiny valid chunk list
-    often enough to matter. Each candidate's own id=1/tag=1 sample
-    sub-chunks (if any) are additionally checked against the §3.1
-    bounded inner-audio-chunk/EOF invariant; a candidate with even one
-    failing sample is rejected and the scan continues. A candidate with no
-    sample sub-chunks at all (a purely param/envelope-referencing
-    instrument, e.g. VSTi-only) is accepted on structural validity alone,
-    since there's nothing to size-check.
+    Fallback for unknown record versions: scan for the start of the
+    instrument's nested chunk list.
 
-    Including `(2, 2)` alongside `(1, 1)`, `(3, 2)`, and `(1, TAG_EOF)` as a
-    valid leading sub-chunk locates 100% of corpus instrument records
-    (including sample-less pre-0.76 text/credit slots whose nested list begins
-    directly with `id=2, tag=2` parameter/envelope records). Returns None
-    rather than guessing if a record does not close cleanly.
+    A candidate must start with a sample, envelope, or EOF header, read
+    exactly to the end of the record, and end in EOF. Mostly-zero keymap
+    bytes can also parse as a short valid list, so every sample in the
+    candidate must also pass the audio-chunk size check. Returns None if no
+    candidate qualifies.
     """
     limit = min(start + window, len(data) - HDR.size + 1)
     for off in range(start, limit):
@@ -644,13 +460,9 @@ def locate_sample_list(data, start, window=SAMPLE_LIST_SEARCH_WINDOW):
 
 def parse_sample_subchunk(rec):
     """
-    One populated sample slot within an instrument (id=1/tag=1 nested
-    chunk). Field offsets are relative to the sample name's NUL, per
-    PROVENANCE.md §3.1 -- volume/panning/finetune/relative_note/
-    loop_start/loop_end/loop_type/format/frames/channels are Verified
-    exact. The 14-byte metadata is followed by an audio chunk list and EOF.
-    The byte at +4 remains unknown. The former unknown u16 at +16 is the
-    audio chunk tag; the former five-byte tail belongs to the EOF header.
+    Parse one sample slot (nested chunk id 1, tag 1): slot number, name,
+    14 metadata bytes, then an audio chunk and EOF. Metadata byte +4 is
+    unknown.
     """
     d = rec.data
     name, n2 = cstring(d, 1)
@@ -663,21 +475,15 @@ def parse_sample_subchunk(rec):
         "name": name,
         "volume": d[n2],
         "volume_raw": d[n2],
-        # Skale displays this byte directly in hexadecimal. Controlled
-        # playback establishes 0x80 as unity and 0x40 as one-half gain.
+        # Shown in hex by Skale. 0x80 is unity, 0x40 half gain.
         "volume_gain": d[n2] / 128.0,
         "panning": d[n2 + 1],
         "panning_raw": d[n2 + 1],
-        # Signed, matching XM's identical field (PROVENANCE.md §3.2):
-        # exporting to .xm reproduces these bytes unchanged, and XM's own
-        # finetune/relative_note are signed -128..127 (fractional-semitone
-        # and semitone transpose respectively). Real corpus values above
-        # 127 only make musical sense as negative transposes.
+        # Signed, as in XM; Skale's XM export copies these bytes unchanged.
         "finetune": struct.unpack_from("<b", d, n2 + 2)[0],
         "relative_note": struct.unpack_from("<b", d, n2 + 3)[0],
         "unknown_a": d[n2 + 4],
-        # Absolute sample-frame positions. A causal fixture with UI values
-        # 0x529A and 0x50AC4 confirms that both are full little-endian u32s.
+        # Absolute sample frames, full u32.
         "loop_start": struct.unpack_from("<I", d, n2 + 5)[0],
         "loop_end": struct.unpack_from("<I", d, n2 + 9)[0],
         "loop_type": LOOP_TYPES.get(loop_type_raw, loop_type_raw),
@@ -713,7 +519,7 @@ def parse_sample_subchunk(rec):
         ),
         "frames": stored_value_count,  # compatibility alias
         "channels": channels,
-        # Legacy alias counts the five-byte value-count/channel prefix.
+        # Compatibility alias; includes the 5-byte count/channels prefix.
         "audio_data_length": audio_chunk_length,
         "audio_payload_length": audio_chunk_length - 5,
         "audio_data_offset": rec.offset + HDR.size + body + 5,
@@ -733,13 +539,12 @@ ENVELOPE_TYPES = {
 
 
 def parse_envelope_subchunk(rec):
-    """Decode one nested (id=2/3, tag=2) instrument envelope sub-chunk.
+    """Decode one envelope chunk (tag 2, id 2 or 3).
 
-    Every instrument record across all versions carries 32 such sub-chunks
-    forming an 8x4 grid: row 0..7 (steps A..H) x col 1..4 (volume, panning,
-    and two additional envelopes). All 32 use the same variable-length point
-    layout: `9 + 4*num_points` bytes for `id=2` (record versions 3/4) and
-    `10 + 4*num_points` bytes for `id=3` (record versions 5/6).
+    Each instrument has 32, forming an 8 x 4 grid: row 0-7 is step A-H,
+    col 1-4 is volume, panning, and two unidentified envelopes. Length is
+    `9 + 4*num_points` for id 2 and `10 + 4*num_points` for id 3.
+    Returns None if the chunk is malformed.
     """
     d = rec.data
     if rec.tag != 2 or rec.id not in (2, 3) or len(d) < 9:
@@ -822,24 +627,13 @@ def parse_instrument_envelope(rec):
 
 def extract_pcm_samples(raw, sample):
     """
-    Read a raw-PCM sample (format 2 or 3) into an array.array of actual
-    sample values, using `sample["audio_data_offset"]`/["frames"] from
-    `parse_sample_subchunk` (absolute file offsets -- fixed 2026-08-08,
-    see the offset-bug note on `audio_data_offset` below).
+    Read a PCM sample (format 2 or 3) into an array.array of signed
+    values: 16-bit little-endian, or 8-bit. `raw` is the whole file;
+    `sample` comes from parse_sample_subchunk. Values are interleaved
+    for stereo.
 
-    format 2 (16-bit) is decoded as signed little-endian: PROVENANCE.md
-    §3.1 found the un-CONV'd "perf" test fixture's audio_data[] bytes
-    byte-identical to their source WAV's own PCM bytes, and standard WAV
-    PCM16 is signed LE -- so no transform is needed or applied here.
-    format 3 (8-bit) is decoded as signed PCM. Fixture 73 was imported from
-    a known unsigned PCM8 WAV and every one of its 44,100 stored bytes equals
-    the corresponding WAV byte XOR 0x80, proving the conversion exactly.
-
-    The bounded payload excludes the following EOF chunk. Only `frames`
-    real sample values are read.
-
-    Raises ValueError if `sample` isn't a located raw-PCM sample, or if
-    the file is too short for the declared frame count.
+    Raises ValueError if `sample` is not a located PCM sample or the data
+    is shorter than its stored value count.
     """
     fmt = sample.get("format_raw")
     if fmt not in BYTES_PER_SAMPLE:
@@ -862,12 +656,10 @@ def extract_pcm_samples(raw, sample):
 
 
 def extract_ogg_stream(raw, sample):
-    """Extract only the Ogg stream inside its audio chunk.
+    """Return the Ogg stream from an Ogg sample's audio chunk.
 
-    The inner `u32` length is self-inclusive: it counts its own four bytes
-    plus the stream (PROVENANCE.md §5.15; 1032/1032 corpus streams end
-    exactly at the audio chunk's end). Older notes described this as an
-    overcount reaching into the EOF header; the bytes checked are the same.
+    The inner u32 length counts its own four bytes plus the stream.
+    Raises ValueError if the length, EOF header, or OggS magic is wrong.
     """
     if sample.get("format_raw") != 4:
         raise ValueError(f"not an Ogg sample (format={sample.get('format')!r})")
@@ -887,22 +679,14 @@ def extract_ogg_stream(raw, sample):
     return stream
 
 
-XM_C4_REFERENCE_HZ = 8363.0  # externally documented, fixed by the XM spec
+XM_C4_REFERENCE_HZ = 8363.0  # XM's reference rate
 
 def native_sample_rate(sample):
     """
-    Derive a raw-PCM sample's native recording rate from `relative_note`/
-    `finetune`, in Hz. PROVENANCE.md §3.2: Skale's own `.xm` exporter
-    writes SKM's `relative_note`/`finetune` bytes through unchanged (a
-    real paired-export test found zero rebasing), so SKM's tuning fields
-    are XM's, not just analogous to them -- and XM's reference frequency
-    for relative_note=0/finetune=0 is a fixed, externally-documented
-    constant (8363 Hz, not stored in any file). Applying
-    `8363 * 2**((relative_note + finetune/128) / 12)` reproduces the true
-    native rates of two authored ground-truth samples (44100/22050 Hz,
-    user-confirmed) to within 0.017% -- the same tiny residual ratio for
-    both, consistent with relative_note/finetune's integer/byte
-    granularity rather than a wrong model.
+    Sample rate in Hz from relative note and finetune, using XM's formula:
+    `8363 * 2**((relative_note + finetune/128) / 12)`. Skale's XM export
+    copies both bytes unchanged, so XM's reference applies. For known
+    44100 and 22050 Hz sources the result is within 0.02%.
     """
     exponent = (sample["relative_note"] + sample["finetune"] / 128) / 12
     return XM_C4_REFERENCE_HZ * (2 ** exponent)
@@ -910,12 +694,8 @@ def native_sample_rate(sample):
 
 def export_sample(raw, sample, out_path, sample_rate=None):
     """
-    Write a located sample's audio out to `out_path` as a standalone,
-    playable file: `.ogg` (raw Vorbis stream, self-describing) for
-    format 4, `.wav` for formats 2/3.
-
-    `sample_rate` defaults to `native_sample_rate(sample)` (§3.2) --
-    pass an explicit value to override.
+    Write a sample to `out_path`: the Ogg stream as-is for format 4, or a
+    WAV file for PCM. `sample_rate` defaults to native_sample_rate(sample).
     """
     if sample.get("format_raw") == 4:
         Path(out_path).write_bytes(extract_ogg_stream(raw, sample))
@@ -936,10 +716,10 @@ def export_sample(raw, sample, out_path, sample_rate=None):
 
 
 def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
-    """Decode the three-band strip from the versioned post-keymap block.
+    """Decode an instrument's mixer strip from its settings block.
 
-    IDs 4/5 have a 284-byte block; ID 6 adds BGR color and a pad.
-    ID 3's older 401-byte settings block is kept raw.
+    Record versions 4-6 only. IDs 4/5 have a 284-byte block; ID 6 adds BGR
+    colour and a pad. Returns None for ID 3 or implausible values.
     """
     if record_version not in (4, 5, 6):
         return None
@@ -961,10 +741,7 @@ def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
     out = {
         "layout": "direct-412" if record_version == 4 else "framed",
         "toggle01": flag(7),
-        # Verified at settings[252] (sample_list_start - 36 in ID 6) via
-        # singlevar/60_instrument_toggles.skm; earlier notes had a 1-digit
-        # typo (-136 -> settings[152]). Across all 1325 corpus/authoring
-        # records in IDs 4-6, flag(252) == 1 - flag(7).
+        # Always 1 - toggle01.
         "toggle01_companion": flag(252),
         "volume_fader": volume, "bal": bal,
         "sub_assign": [flag(o) for o in range(253, 257)],
@@ -977,14 +754,12 @@ def parse_mixer_strip(data, sample_list_start, prefix_len, record_version=None):
 
 
 def parse_settings_block(settings, record_version):
-    """Decode structure shared by the versioned post-keymap settings blocks.
+    """Decode the settings block that follows the keymap.
 
-    The first 130 bytes are common to IDs 3-6 (PROVENANCE.md §5.15). The 16
-    send knobs are 13-byte records in ID 3 (flag, f32 value, f32 0.0,
-    f32 1.0) and 6-byte records in IDs 4-6 (flag, f32 value, u8 index);
-    flag/value agree 1392/1392 across a 0.75 file and its 0.81 resave.
-    Offsets 126-127 and (in IDs 4-6) 149 are the Instr. Ed. Ext. VSTi
-    linkage fields causally verified by singlevar/37, 45, 46, and 47.
+    The first 130 bytes are laid out the same in IDs 3-6. The 16 send
+    knobs are 13-byte records in ID 3 (flag, f32 value, f32 0.0, f32 1.0)
+    and 6-byte records in IDs 4-6 (flag, f32 value, u8 index). Offsets 126,
+    127, and (IDs 4-6) 149 link the instrument to a section 6 synth.
     """
     f32 = lambda off: struct.unpack_from("<f", settings, off)[0]
     if record_version == 3:
@@ -997,16 +772,14 @@ def parse_settings_block(settings, record_version):
                  for o in range(156, 156 + 16 * 6, 6)]
     out = {
         "send_knobs": knobs,
-        # Identity (entry i == i) in 1777/1793 corpus records; the only
-        # deviations remap entry 7 to 16 or 17. Meaning unidentified.
+        # Almost always the identity map. Unknown.
         "table_25": list(settings[25:89]),
-        # Instr. Ed. Ext. VSTi linkage (PROVENANCE.md §5.6.10, §5.7.1, §5.16):
-        # settings[126] = 1 when Synth mode is selected (0 otherwise);
-        # settings[127] = 0-based Section 6 synth slot index (Device 01 -> 0).
+        # 126: 1 on VSTi-linked instruments (Probable).
+        # 127: 0-based section 6 synth slot (Device 01 is 0).
         "ext_synth_mode": settings[126],
         "vsti_device": settings[127],
-        # Probable instrument-filter block (Conjecture): defaults
-        # 5000/5000/50/0.5/0.5/0/10, edited values in steps of 1/42.
+        # Probably the instrument filter. Defaults 5000, 5000, 50, 0.5,
+        # 0.5, 0, 10. Unknown.
         "unidentified": {
             "u8_89": settings[89], "f32_90": f32(90), "f32_94": f32(94),
             "u8_98": settings[98], "f32_102": f32(102), "f32_106": f32(106),
@@ -1028,16 +801,12 @@ def parse_settings_block(settings, record_version):
 def instrument_prefix(data, name_end, record_version):
     """Return (128 local slots, keymap end, nested-list start, entries), or None.
 
-    Chunk ID selects direct versus variable-length framed entries. Unknown
-    record versions are preserved by the caller rather than guessed.
-
-    A framed entry is read as `u8 flag, u8 layer_count, layer[layer_count]`
-    with 4-byte layers (PROVENANCE.md §5.15). Every observed entry is either
-    `00 00` (unmapped) or `01 01 <slot> 00 7F 00` (one layer); that the
-    second byte is a count and the 00/7F pair a range is Conjecture, so
-    other layer bytes are preserved raw rather than rejected. Unmapped
-    entries are reported as slot 0 in the compatibility list and as
-    `None` in `entries`.
+    IDs 3/4 have one byte per keymap entry; IDs 5/6 have framed entries,
+    read as `u8 flag, u8 layer_count, layer[layer_count]` with 4-byte
+    layers. Every observed framed entry is `00 00` (unmapped) or
+    `01 01 <slot> 00 7F 00`. The count reading is Probable, so other layer
+    bytes are kept rather than rejected. Unmapped entries are slot 0 in the
+    slot list and None in `entries`. Returns None for other record versions.
     """
     if record_version not in (3, 4, 5, 6):
         return None
@@ -1071,11 +840,11 @@ def instrument_prefix(data, name_end, record_version):
 
 
 def parse_instruments(chunk, version_raw=None):
-    """Decode Section 3 using the instrument chunk ID as record version.
+    """Parse section 3. The instrument chunk ID is the record version.
 
-    Known layouts consume 128 keymap entries and a versioned settings block.
-    Unknown IDs retain the bounded structural-search fallback, explicitly
-    marked as such; they do not acquire guessed keymap or mixer fields.
+    IDs 3-6 are read directly. For other IDs the nested list is found by
+    locate_sample_list, `prefix_source` says so, and no keymap or mixer
+    fields are reported.
     """
     records, consumed = read_chunks(chunk.data, base=chunk.offset + HDR.size)
     out = []
@@ -1175,21 +944,17 @@ def parse_instruments(chunk, version_raw=None):
 
 def parse_fx_slot(rec):
     """
-    Decode one FX-chain plugin slot (PROVENANCE.md §4, Verified 2026-08-05):
+    Parse one FX slot record.
 
-        u8    slot_index    -- FX-rack slot number; sparse, not necessarily
-                                sequential within the file (empty slots are
-                                simply omitted, not written as blanks)
-        cstr  path           -- DLL path as saved by the authoring install
-        cstr  display_name    -- plugin's own self-reported name
-        u8    loaded           -- always 0x01 so far
-        f32   mixer_volume     -- Skale FX-strip fader; not bounded to [0,1]
-        f32   wet_or_pan        -- almost always 0.5; varies independently
-        u8    bypassed          -- 0 enabled, 1 disabled in the 0.76 probe
-        u32   param_count         -- plugin's automatable parameter count
-        f32   params[param_count]  -- one float per parameter
-
-    Verified byte-exact (zero slack) on all FX slots across the corpus.
+        u8    slot_index            0-based rack slot; empty slots omitted
+        cstr  path                  plugin DLL path
+        cstr  display_name          plugin's own name
+        u8    loaded                always 1 so far
+        f32   mixer_volume          FX strip fader, not limited to 0-1
+        f32   wet_or_pan            usually 0.5; probably balance
+        u8    bypassed              0 enabled, 1 disabled
+        u32   param_count
+        f32   params[param_count]
     """
     d = rec.data
     slot_index = d[0]
@@ -1208,8 +973,7 @@ def parse_fx_slot(rec):
         "display_name": name,
         "loaded": loaded,
         "mixer_volume": mixer_volume,
-        # Compatibility aliases retained while downstream research scripts
-        # migrate to the causally verified names above.
+        # Older names, kept for compatibility.
         "enabled": loaded,
         "dry_wet": mixer_volume,
         "wet_or_pan": wet_or_pan,
@@ -1222,9 +986,7 @@ def parse_fx_slot(rec):
 
 
 def parse_fx_chain(chunk):
-    """Section 4: a nested chunk list, one id=0x0002/tag=0x0001 record per
-    loaded FX plugin, terminated by the standard EOF chunk. See
-    PROVENANCE.md §4."""
+    """Parse section 4: one chunk (id 2, tag 1) per FX plugin, then EOF."""
     recs, consumed = read_chunks(chunk.data, base=chunk.offset + HDR.size)
     slots = []
     for rec in recs:
@@ -1240,16 +1002,16 @@ def parse_fx_chain(chunk):
 
 
 def parse_vsti_skale_state(raw):
-    """Decode the fixed 110-byte Skale-owned per-synth mixer strip in Section 6.
+    """Decode the 110-byte mixer strip at the end of a section 6 synth record.
 
-    Layout (PROVENANCE.md §5.7.2 & §5.16, Verified across 29/29 workspace
-    records spanning Albino, Vanguard, Trionic, oxid, and mdaJX10):
         offset 0       u8    unknown_0 (always 0)
         offset 1..96   16x   send_knob (u8 flag, f32 value, u8 pad)
         offset 97..100 f32   bal (zero-centered in [-0.5, +0.5], default 0.0)
         offset 101..104 f32  volume_fader (default 1.0)
         offset 105..108 u8[4] sub_assign (SUB1..SUB4 routing flags in {0, 1})
         offset 109     u8    mute_or_toggle (in {0, 1}, default 0)
+
+    Returns None if the length or any value is out of range.
     """
     if len(raw) != 110:
         return None
@@ -1284,15 +1046,14 @@ def parse_vsti_skale_state(raw):
 
 def parse_section6(chunk):
     """
-    Section 6 holds per-instrument VSTi data when populated -- see
-    PROVENANCE.md §4. Whether it also holds subsong data as a
-    differently-shaped entry is untested.
+    Parse section 6: one record per loaded VSTi synth.
 
-    A populated record shares section 4's slot_index/path/display_name
-    header shape. A clean Skale 0.81 mdaJX10 causal family establishes an
-    explicit u32 plugin-parameter count followed immediately by exactly that
-    many plugin parameter floats, and a fixed 110-byte Skale-owned per-synth
-    mixer strip (`skale_state`, PROVENANCE.md §5.16).
+        u8    slot_index
+        cstr  path
+        cstr  display_name
+        u32   plugin_param_count
+        f32   plugin_params[plugin_param_count]
+        u8    skale_state[110]      see parse_vsti_skale_state
     """
     recs, consumed = read_chunks(chunk.data, base=chunk.offset + HDR.size)
     entries = []
@@ -1334,57 +1095,27 @@ def parse_section6(chunk):
 
 
 def parse_global(chunk):
-    """Section 5 (global/mixer). See PROVENANCE.md §5.
+    """Parse section 5 (global mixer).
 
-    Serialized versions below 7600: 4 bytes, a single f32 master volume.
-    Observed files stamped 7600: 424 bytes --
-        offset 0-3    f32 master_volume (Verified: causal Wine-GUI test,
-                       drag master fader -> only these 3 low bytes change)
-        offset 4-135  132 bytes = 4 x 33-byte SUB1-4 bus records. Layout
-                       fully Verified 2026-08-09 by a run of causal
-                       Wine-GUI drag/save/diff tests, each isolating to
-                       exactly the bytes predicted: `fader` (SUB1 and
-                       SUB3), `balance` (SUB1 and SUB2), a knob `value`
-                       (SUB1 and SUB4), and knob `pad` (SUB1) all
-                       independently confirmed; SUB2-4 confirmed to share
-                       SUB1's exact record layout, not just assumed by
-                       symmetry. Per-SUB record (33 bytes):
-                         u8   flag0            0 normally, seen 1 on a
-                                                real-world edited song
-                                                (tropical coast walk.skm)
-                                                and inferred (not
-                                                independently drag-tested)
-                                                to be the same kind of
-                                                per-control toggle `pad`
-                                                below was confirmed to be
-                         f32  fader             default 1.0 (Verified)
-                         f32  balance            default 0.5 (offset 5 of the
-                                                record = absolute offset 9;
-                                                this is `sub1_balance` below,
-                                                Verified 2026-08-09 causally)
-                         then 4x knob record (6 bytes each), one per the
-                         mixer's fixed "01".."04" send knobs (label N ==
-                         0-based index N-1, confirmed via SUB4 knob "03"):
-                           u8   pad             0 normally, 1 when the
-                                                knob's own small LED/dot
-                                                is clicked (Verified: a
-                                                causal test isolated this
-                                                exact byte, 1-byte diff in
-                                                the whole file)
-                           f32  value            default 1.0 (Verified on
-                                                SUB1 knob 0 and SUB4 knob 2)
-                           u8   index            0,1,2,3 -- always in fixed
-                                                order corpus-wide, unlike the
-                                                FX matrix's re-routable
-                                                target_bus
-        offset 136-423  32 x 9-byte FX-bus cross-send records (Verified,
-                       same test methodology; see fx_bus_matrix below)
+    Header version below 7600: 4 bytes, one f32 (probably master volume).
+    Version 7600: 424 bytes.
 
-    Note: an FX bus's own fader/balance controls (as opposed to the SUB
-    buses' above) are NOT stored here -- a causal test dragging both on
-    a loaded FX plugin touched section 4's mixer_volume/wet_or_pan fields
-    instead, leaving section 5 byte-identical. See PROVENANCE.md §5's
-    2026-08-09 update.
+        0-3      f32 master_volume
+        4-135    SUB1-4, 33 bytes each:
+                   u8   flag0       usually 0; unknown
+                   f32  fader       default 1.0
+                   f32  balance     default 0.5
+                   4 send knobs, 6 bytes each:
+                     u8   pad       1 when the knob's LED is clicked
+                     f32  value     default 1.0
+                     u8   index     0-3, in order
+        136-423  FX-bus sends, 32 x 9 bytes (8 buses x 4 sends):
+                   u8   enabled_flag    unknown
+                   u32  target_bus      0xFFFFFFFF = none
+                   f32  send_level
+
+    An FX bus's own fader and balance are in section 4, not here.
+    `sub1_balance` is a shortcut to SUB1's balance.
     """
     data = chunk.data
     out = {"raw": data.hex()}
@@ -1420,14 +1151,8 @@ def parse_global(chunk):
     matrix = []
     for i in range(32):
         off = 136 + i * 9
-        # Named "enabled" on a corpus-wide hunch, not a causal test: it's
-        # 0 in every corpus file where the slot was never touched in the
-        # GUI, but *also* 0 in this session's own causal test after
-        # editing send_level (see PROVENANCE.md §5) -- so editing the
-        # knob itself doesn't set it. It does turn up 1 on real-world
-        # songs, on both default- and edited-level slots, consistent with
-        # a separate small LED/toggle seen next to each knob in the UI
-        # that this session never clicked. Probable, not Verified.
+        # Unknown. Usually 0, sometimes 1; changing send_level alone
+        # leaves it 0. Possibly the LED beside each send knob.
         enabled_flag = data[off]
         target_bus = struct.unpack_from("<I", data, off + 1)[0]
         send_level = struct.unpack_from("<f", data, off + 5)[0]
@@ -1475,7 +1200,7 @@ def parse_skm(path):
         try:
             result[key] = (fn(c, result.get("header", {}).get("version_raw"))
                            if c.tag == 3 else fn(c))
-        except Exception as exc:  # keep going; this is exploratory tooling
+        except Exception as exc:  # report the error and parse the other sections
             result[key] = {"error": f"{type(exc).__name__}: {exc}"}
 
     result["has_ogg_samples"] = b"OggS" in raw
@@ -1516,7 +1241,7 @@ def report(info):
         pct = (100 * clean_tracks / len(all_tracks)) if all_tracks else 0
         print(f"  tracks         : channel-major, {clean_tracks}/{len(all_tracks)} "
               f"({pct:.1f}%) decode with exact byte consumption "
-              f"(see PROVENANCE.md §6 for the residual)")
+              f"(should be 100%)")
     if "instruments" in info:
         ins = info["instruments"]
         recs = ins.get("instruments", [])
@@ -1605,27 +1330,64 @@ def report(info):
     print(f"  ogg samples    : {info['has_ogg_samples']}")
 
 
+def _malformed_fixtures(root, files):
+    """
+    Return (expected_reject, expected_invalid) sets of paths from
+    `root/manifest.json`. Both are empty when there is no manifest.
+    """
+    manifest_path = Path(root) / "manifest.json"
+    if not manifest_path.is_file():
+        return set(), set()
+    rejects = set()
+
+    def walk(o):
+        if isinstance(o, dict):
+            if o.get("expected_parse") == "reject" and "path" in o:
+                rejects.add(Path(o["path"]).as_posix())
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(json.loads(manifest_path.read_text()))
+    expected_reject = {f for f in files
+                       if any(r == f.as_posix() or r.endswith("/" + f.relative_to(root).as_posix())
+                              for r in rejects)}
+    expected_invalid = {f for f in files
+                        if f.name.startswith("invalid-") and f not in expected_reject}
+    return expected_reject, expected_invalid
+
+
 def verify_corpus(root):
     """
-    Regression check across every .skm under `root`. This is the
-    corpus-wide counterpart to `report()`'s single-file view: it re-checks
-    every exactness claim this parser makes -- container coverage, the
-    tag-1 trailer's cross-checks against the header/section-2 channel
-    count, FX-slot byte-exactness, the legacy section-6 flat-float
-    diagnostic, pattern-track decode rate, and instrument-internals location
-    rate --
-    and prints pass/fail counts per category rather than per-file detail.
-    Exit code is nonzero if any file fails outright (raises/mismatched
-    container coverage), so it's usable as a CI-style gate. Pattern-track
-    decode rate reached 100% on 2026-08-08 and should stay there -- treat
-    any drop as a real regression, not an open percentage. Instrument
-    internals location is a softer corpus statistic (see §3) and does
-    not fail the run. Section 6's `[0,1]` percentage is informational only:
-    §4 disproved the one-flat-normalized-parameter-array hypothesis.
+    Check every .skm under `root` and print pass/fail counts per check:
+    container coverage, song-text trailer against header and channel
+    count, FX slot and synth record exactness, track decoding, pattern
+    framing, instrument layout, samples, order lists, and the global mixer.
+
+    Returns nonzero if any file fails a hard check, so it can gate CI.
+    Every track must decode exactly. The share of synth parameters in
+    [0, 1] is informational only.
+
+    If `root` holds a fixture `manifest.json`, deliberately malformed
+    fixtures are reported separately instead of as hard failures: a file
+    with `expected_parse: reject` must fail to parse, and a file named
+    `invalid-*` may fail content checks but must still parse.
     """
     files = sorted(Path(root).glob("**/*.skm"))
     n = len(files)
+    expected_reject, expected_invalid = _malformed_fixtures(root, files)
     hard_failures = []
+    expected_failures = []
+
+    def fail(entry):
+        f_ = entry[0]
+        if f_ in expected_reject or f_ in expected_invalid:
+            expected_failures.append(entry)
+        else:
+            hard_failures.append(entry)
+
     fully_covered = 0
     trailer_checks = {"channel_match": 0, "version_match": 0, "reserved_zero": 0, "total": 0}
     fx_slots_total = fx_slots_exact = 0
@@ -1650,11 +1412,19 @@ def verify_corpus(root):
             info = parse_skm(f)
             raw = f.read_bytes()
         except Exception as exc:
-            hard_failures.append((f, f"parse_skm raised: {type(exc).__name__}: {exc}"))
+            if f in expected_invalid:
+                hard_failures.append((f, "invalid-* fixture must still parse; "
+                                      f"parse_skm raised: {type(exc).__name__}: {exc}"))
+            else:
+                fail((f, f"parse_skm raised: {type(exc).__name__}: {exc}"))
+            continue
+        if f in expected_reject:
+            hard_failures.append((f, "manifest expects this file to be "
+                                  "rejected, but it parsed"))
             continue
         if not info.get("fully_covered"):
-            hard_failures.append((f, f"container coverage mismatch: consumed "
-                                  f"{info['bytes_consumed']:,} of {info['size']:,}"))
+            fail((f, f"container coverage mismatch: consumed "
+                  f"{info['bytes_consumed']:,} of {info['size']:,}"))
         else:
             fully_covered += 1
 
@@ -1686,21 +1456,21 @@ def verify_corpus(root):
             if e.get("skale_state_exact"):
                 s6_skale_state_exact += 1
             else:
-                hard_failures.append((f, f"section-6 slot {e.get('slot_index')} "
-                                      "skale_state_raw is not a valid 110-byte strip"))
+                fail((f, f"section-6 slot {e.get('slot_index')} "
+                      "skale_state_raw is not a valid 110-byte strip"))
 
         if p:
             pattern_sections_total += 1
             if p.get("walk_clean") and p.get("all_tracks_clean") is not False:
                 pattern_sections_exact += 1
             else:
-                hard_failures.append((f, "section-2 chunk list or track framing not exact"))
+                fail((f, "section-2 chunk list or track framing not exact"))
         for r in p.get("patterns", []):
             patterns_total += 1
             if r.get("rows"):
                 patterns_rows_nonzero += 1
             else:
-                hard_failures.append((f, f"pattern {r.get('index')} has u16 rows == 0"))
+                fail((f, f"pattern {r.get('index')} has u16 rows == 0"))
             for tr in r.get("tracks", []):
                 tracks_total += 1
                 if tr.get("events_clean"):
@@ -1724,8 +1494,8 @@ def verify_corpus(root):
             if p["repeat_pattern"] < p["song_length"]:
                 repeat_patterns_in_range += 1
             else:
-                hard_failures.append((f, f"repeat_pattern {p['repeat_pattern']} "
-                                      f"is outside song_length {p['song_length']}"))
+                fail((f, f"repeat_pattern {p['repeat_pattern']} "
+                      f"is outside song_length {p['song_length']}"))
 
         g = info.get("global", {})
         if "sub_buses" in g:
@@ -1756,8 +1526,8 @@ def verify_corpus(root):
                 if rec.get("envelope_grid_exact"):
                     envelope_grids_exact += 1
                 else:
-                    hard_failures.append((f, f"instrument {rec.get('index')} "
-                                          "envelope grid is not an exact 8x4 grid"))
+                    fail((f, f"instrument {rec.get('index')} "
+                          "envelope grid is not an exact 8x4 grid"))
             if "mixer_strip" in rec and h.get("version_raw") == 7600:
                 mixer_strip_total += 1
                 if rec["mixer_strip"] is not None:
@@ -1791,7 +1561,13 @@ def verify_corpus(root):
     print("=" * 68)
     print(f"corpus verification: {n} files under {root}")
     print()
-    print(f"  container coverage       : {pct(fully_covered, n)}  <- must be 100%")
+    print(f"  container coverage       : {pct(fully_covered, n - len(expected_reject))}  "
+          f"<- must be 100%, excluding files the manifest expects to be rejected")
+    if expected_reject or expected_invalid:
+        print(f"  deliberately malformed    : {len(expected_reject)} expected to be "
+              f"rejected, {len(expected_invalid)} invalid-* expected to parse")
+        for f, msg in expected_failures:
+            print(f"      (expected) {f}: {msg}")
     if hard_failures:
         print(f"  HARD FAILURES             : {len(hard_failures)}")
         for f, msg in hard_failures[:20]:
@@ -1799,7 +1575,7 @@ def verify_corpus(root):
         if len(hard_failures) > 20:
             print(f"      ... {len(hard_failures) - 20} more")
     print()
-    print("  tag-1 trailer cross-checks (PROVENANCE.md §1, Verified -- must be 100%):")
+    print("  section 1 trailer cross-checks (must be 100%):")
     print(f"      version_raw == header version : "
           f"{pct(trailer_checks['version_match'], trailer_checks['total'])}")
     print(f"      reserved byte == 0            : "
@@ -1808,41 +1584,40 @@ def verify_corpus(root):
           f"{pct(trailer_checks['channel_match'], trailer_checks['total'])}")
     print()
     print(f"  FX chain slots exact      : {pct(fx_slots_exact, fx_slots_total)}  "
-          f"<- must be 100% (§4, Verified)")
+          f"<- must be 100%")
     print(f"  section 6 plugin params    : {pct(s6_entries_in_range, s6_entries_total)}  "
           f"<- counted prefixes recognized; [0,1] range is informational "
           f"and plugin-specific")
     print(f"  section 6 skale_state     : {pct(s6_skale_state_exact, s6_entries_total)}  "
-          f"<- must be 100% (§5.16, Verified: fixed 110-byte synth mixer strip)")
+          f"<- must be 100% (110-byte synth mixer strip)")
     print()
     print(f"  pattern chunk lists exact : {pct(pattern_sections_exact, pattern_sections_total)}  "
-          f"<- must be 100% (§5.15): pattern chunks + track mini-chunks + EOF, "
+          f"<- must be 100%: pattern chunks, track chunks, and EOF, "
           f"one track per channel")
     print(f"  pattern rows (u16) > 0    : {pct(patterns_rows_nonzero, patterns_total)}  "
-          f"<- must be 100% (§5.15): Skale writes 256 rows as 00 01")
+          f"<- must be 100%: Skale writes 256 rows as 00 01")
     print(f"  pattern tracks exact      : {pct(tracks_clean, tracks_total)}  "
-          f"<- must be 100% (§6, Verified 2026-08-08)")
+          f"<- must be 100%")
     print(f"  reserved/last_row consist.: {pct(tracks_row_offset_consistent, tracks_total)}  "
-          f"<- expected 100% (§6, Verified); row absolute-positioning "
-          f"uses `reserved`")
+          f"<- expected 100%; rows are positioned from `reserved`")
     if row_overflow:
         print(f"  ROW PADDING OVERFLOW      : {len(row_overflow)}  "
               f"<- must be 0 (a track ended up longer than its pattern's "
-              f"own row count -- the 256-wrap fix or padding logic is wrong)")
+              f"own row count -- the padding logic is wrong)")
         for f, idx, ch in row_overflow[:10]:
             print(f"      {f}: pattern {idx} channel {ch}")
     print(f"  instrument internals loc. : {pct(instruments_located, instruments_total)}  "
-          f"<- record-version layouts include sample-less text/credit slots")
+          f"<- includes instruments with no samples")
     print(f"  instrument 8x4 env grids  : {pct(envelope_grids_exact, envelope_grids_total)}  "
-          f"<- must be 100% (§5.16, Verified: 32 variable-length A..H x 1..4 "
-          f"sub-chunks per instrument)")
+          f"<- must be 100%: 32 envelope chunks per instrument, except "
+          f"deliberately malformed fixtures")
     print(f"  mixer_strip sane (0.76)   : {pct(mixer_strip_sane, mixer_strip_total)}  "
-          f"<- versioned 284/288-byte strips; unknown fields remain raw")
+          f"<- record versions 4-6; unknown fields stay raw")
     print(f"  sample header+audio exact : {pct(samples_size_exact, samples_total)}  "
-          f"<- must be 100% where located (§3.1, Verified 2026-08-08)")
+          f"<- must be 100% where located")
     print(f"  sample audio extracted    : {pct(samples_extract_ok, samples_extract_total)}  "
-          f"<- must be 100% where size-exact (extract_pcm_samples/"
-          f"extract_ogg_stream, §3.1 update 2026-08-08)")
+          f"<- must be 100% where size-exact, except deliberately "
+          f"malformed fixtures")
     print(f"  order list in range       : {pct(order_lists_in_range, order_lists_total)}  "
           f"<- informational: Skale may preserve references to absent "
           f"pattern IDs and presents them as synthetic empty patterns")
@@ -1850,16 +1625,11 @@ def verify_corpus(root):
           f"<- must be 100% (Skale's REPEAT PATT. restart order)")
     print(f"  global (sec5) fx targets  : {pct(global_424_clean, global_424_total)}  "
           f"at their structural default (source_bus+slot+1, sentinel past "
-          f"bus 7) -- an *informational* stat, not a hard invariant: "
-          f"target_bus is a real editable field (§5, Verified "
-          f"2026-08-08), so a deviation is a genuinely re-routed send, "
-          f"not a bug")
+          f"bus 7) <- informational: a different target is a "
+          f"re-routed send, not an error")
     print(f"  global (sec5) SUB records : {pct(sub_bus_records_clean, sub_bus_records_total)}  "
-          f"<- must be 100% (§5, layout Verified 2026-08-09 via causal "
-          f"Wine-GUI tests across all 4 SUB buses): each SUB1-4 record's "
-          f"flag0/knob-pad bytes in {{0,1}} and knob index bytes in fixed "
-          f"0,1,2,3 order -- a drop means the 33-byte SUB record layout "
-          f"is wrong or a new corpus file breaks it")
+          f"<- must be 100%: flag0 and knob pad bytes are 0 or 1, and "
+          f"knob indices are 0,1,2,3")
     print("=" * 68)
 
     return len(hard_failures) == 0
@@ -1875,8 +1645,8 @@ def main():
     ap.add_argument("--extract-samples", metavar="OUTDIR", type=Path,
                      help="export every located sample from the given file(s) "
                           "to OUTDIR as .ogg/.wav (see export_sample); raw-PCM "
-                          "rate is auto-derived from relative_note/finetune "
-                          "(§3.2) unless --sample-rate overrides it")
+                          "rate is derived from relative_note/finetune "
+                          "unless --sample-rate overrides it")
     ap.add_argument("--sample-rate", type=int, default=None,
                      help="override the auto-derived sample rate (Hz) when "
                           "exporting raw-PCM samples with --extract-samples")

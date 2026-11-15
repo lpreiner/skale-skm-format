@@ -5,30 +5,21 @@ meta:
   endian: le
   license: CC0-1.0
 doc: |
-  Skale Tracker `.SKM` module format, reverse-engineered by observation only
-  (no Skale binary was disassembled, decompiled, or debugged -- see
-  `PROVENANCE.md`). Ported from the independent reference parser
-  `skmparse.py`; field names and confidence levels below mirror it exactly,
-  status as of 2026-10-19. Canonical project:
+  Skale Tracker `.skm` module format. Field names and confidence levels
+  match the reference parser `reference/skmparse.py`; the format is
+  described in `FORMAT.md` and the evidence in `PROVENANCE.md`.
   https://github.com/lpreiner/skale-skm-format
 
-  Covers: the flat/recursive chunk container, the file header, song text
-  (title/message/timing trailer), section 2 (order list, pattern records,
-  per-channel tracks, and the confirmed two-mode per-row event grammar),
-  section 4 (FX chain), section 5 (global/mixer, both the 4-byte pre-0.76
-  and 424-byte shape observed in 0.76), section 3's verified instrument
-  variants (including the 128-entry keymap, versioned settings block,
-  sample sub-chunks, and 32-entry 8x4 variable-length envelope grid),
-  and section 6's counted VSTi parameter prefix plus fixed 110-byte
-  Skale-owned per-synth mixer strip.
+  Covers every section: the chunk container, file header, song text,
+  orders and patterns (including the row-token grammar), instruments for
+  record versions 3-6, the VST2 FX chain, the global mixer, and VSTi synth
+  records.
 
-  KNOWN GAPS, not yet done (see PROVENANCE.md Sec 6 for the full
-  list with reasoning): reserved/last_row absolute-row
-  padding (tokens here are still track-local, unlike skmparse.py's
-  parse_tracks); and skmparse.py's cross-record consistency checks
-  (order_list_in_range and friends), which this spec doesn't re-assert.
-  Source generation is validated for Python, C++ STL, C#, and JavaScript.
-  Generated sources are release artifacts rather than committed files.
+  Not covered here, but done by the reference parser: placing track rows at
+  their absolute positions (`tokens` are in stored order starting at
+  `reserved`), and cross-record checks such as order-list references.
+
+  Source generation is tested for Python, C++ STL, C#, and JavaScript.
 seq:
   - id: chunks
     type: chunk
@@ -38,19 +29,15 @@ instances:
   version_raw:
     value: chunks[0].body.as<header_section>.version_raw
     doc: >
-      The serialized version stamp. It distinguishes older framing but cannot
-      select among all layouts stamped 7600: Skale 0.76, 0.80, 0.802, and
-      0.81 produced distinct instrument prefixes under that value.
+      Header version stamp. Skale 0.76, 0.80, 0.802, and 0.81 all write 7600,
+      so it cannot select the instrument layout; the instrument chunk ID does.
 
 types:
   chunk:
     doc: |
-      The whole file, and every nested list within it (instrument
-      sub-chunks, FX-chain slots, ...), is this same 8-byte-header chunk
-      repeated. `id` distinguishes binary (1) vs. record/text (3) chunks;
-      `tag` is 0xfffe for the one-off file header, 1..6 for a top-level
-      section index, or 0xffff for the list's own terminator (length
-      always 0).
+      The file, and every nested list in it, is a sequence of chunks with
+      this 8-byte header. At the top level, `tag` is 0xfffe for the file
+      header, 1-6 for a section, or 0xffff (length 0) for the end of the list.
     seq:
       - id: id
         type: u2
@@ -84,42 +71,26 @@ types:
 
   header_section:
     doc: |
-      Top-level tag 0xfffe. Verified for files authored with Skale 0.70,
-      0.71, 0.75, 0.76, 0.80, 0.802, and 0.81. Observed serialized stamps
-      range from 7000 through 7600.
+      Top-level tag 0xfffe. Observed stamps are 7000, 7100, 7500, and 7600.
     seq:
       - id: magic
         contents: "ALIM3"
       - id: version_raw
         type: u4
-        doc: version * 10000, e.g. 7100 -> Skale 0.71
+        doc: Version × 10000; 7100 is Skale 0.71.
     instances:
       version:
         value: version_raw / 10000.0
 
   song_text_section:
     doc: |
-      Top-level tag 1. Layout is front-anchored (title, then an optional NUL
-      separator, then a free-text message) and back-anchored by the fixed
-      8-byte timing/version trailer. `message`'s length is whatever's left
-      between them, computed from the chunk's own total size rather than a
-      stored length field, and it is NUL-padded to reach the trailer.
+      Top-level tag 1: the title, an optional NUL separator, the message,
+      then a fixed 8-byte trailer. The message has no length field; it is
+      whatever lies between the title and the trailer.
 
-      The separator is optional in practice, so it is not a `seq` field: the
-      region between title and trailer is captured raw as `text_region`, and
-      `message` is an instance that skips a leading NUL only when one is
-      actually there. Consuming it unconditionally swallowed the first message
-      character of any file without a separator (fixed 2026-08-25; see
-      `tests/fixtures/generated/song-text-short-padding.skm`, which reads
-      "Msg" here and did read "sg").
-
-      The 10-byte zero footer is real and fixed-width for Skale-emitted files
-      (PROVENANCE.md section 1: inserting one extra zero shifts Skale's own
-      reader by exactly one byte). It is not modelled as a separate field here
-      because doing so requires reserving 10 bytes unconditionally, which
-      truncates the message of any file whose run is shorter -- as two
-      hand-authored probe fixtures are. Sizing `message` against the trailer
-      instead is correct for both, and callers rstrip the padding anyway.
+      Skale itself also writes a ten-byte zero footer before the trailer.
+      It is not a field here, because some valid files have a shorter NUL
+      run and reserving ten bytes would truncate their message.
     seq:
       - id: title
         type: strz
@@ -127,28 +98,25 @@ types:
       - id: text_region
         size: _io.size - _io.pos - 8
         doc: >
-          Everything between the title and the trailer: an optional single-NUL
-          separator, the message, and the NUL padding. Kept as raw bytes so the
-          separator can be skipped conditionally -- consuming it unconditionally
-          swallows the first message character in files that do not have one.
+          Raw bytes between the title and the trailer: optional separator,
+          message, and NUL padding.
       - id: trailer
         type: trailer_t
     instances:
       separator_ok:
         value: text_region.size > 0 and text_region[0] == 0
-        doc: True when a NUL separator follows the title, as in the canonical layout.
+        doc: True when a NUL separator follows the title.
       message:
         pos: '_io.size - 8 - text_region.size + (separator_ok ? 1 : 0)'
         size: 'text_region.size - (separator_ok ? 1 : 0)'
         type: str
         encoding: ISO-8859-1
         doc: >
-          The message region, with the separator skipped only when one is
-          actually present. Still NUL-padded to reach the trailer; callers
-          rstrip trailing \x00 themselves.
+          The message, with the separator skipped only if present. Still
+          NUL-padded; strip trailing NULs.
 
   trailer_t:
-    doc: The 8-byte tail of section 1 -- initial playback timing plus a second, redundant version stamp.
+    doc: Last 8 bytes of section 1.
     seq:
       - id: initial_bpm
         type: u1
@@ -160,46 +128,32 @@ types:
         type: u1
       - id: version_raw
         type: u4
+        doc: Copy of the header version.
 
   patterns_section:
-    doc: |
-      Top-level tag 2: the order list followed by pattern data. Verified
-      byte-exact across the supported corpus (skmparse.py's
-      `parse_patterns`/`parse_tracks`/`decode_events`).
+    doc: Top-level tag 2. The order list followed by pattern chunks.
     seq:
       - id: channel_count
         type: u1
       - id: order_list_raw
         size: 256
         doc: >
-          Pattern indices; only the first `song_length` bytes are real,
-          the rest is leftover/uninitialized editor state (not
-          necessarily zero -- do not use trailing-zero-stripping to find
-          the real length, use `song_length`).
+          Pattern IDs. Only the first `song_length` entries are used; the rest
+          is leftover data and may be nonzero.
       - id: song_length
         type: u1
-        doc: >
-          Skale's own "SONG LENGTH" field (confirmed against the live
-          GUI, not inferred) -- the authoritative order-list length.
+        doc: Number of order entries in use (Skale's SONG LENGTH).
       - id: repeat_pattern
         type: u1
-        doc: >
-          Skale's "REPEAT PATT." field: the order position to restart at
-          after reaching the end of the song.
+        doc: Order position playback restarts from (Skale's REPEAT PATT.).
       - id: patterns
         type: pattern_chunk(channel_count)
         repeat: until
         repeat-until: _.tag == 0xffff or _io.eof
-        doc: >
-          An ordinary chunk list from offset 0x103, closed by the standard
-          EOF chunk (01 00 FF FF 00 00 00 00 -- formerly "the 8-byte section
-          tail"). PROVENANCE.md Sec 5.15, 171/171 files exact.
+        doc: Chunk list from offset 0x103, closed by the standard EOF chunk.
 
   pattern_chunk:
-    doc: |
-      One pattern as an ordinary (id=1, tag=1, u32 length) chunk. The
-      historical "signature 01 00 01 00 + u16 packed_size + u16 reserved"
-      is this header; the reserved word is the length's high half.
+    doc: One pattern, as an ordinary chunk with id 1, tag 1.
     params:
       - id: channel_count
         type: u1
@@ -226,22 +180,15 @@ types:
         type: u1
       - id: rows
         type: u2
-        doc: >
-          Row count as a u16 (Verified, Sec 5.15): every 256-row pattern
-          Skale wrote stores 00 01. The former "u8 rows, 0 means 256" model
-          read only the low byte and called the high byte reserved.
+        doc: Row count, 1-256. Skale writes 256 as 00 01.
       - id: tracks
         type: track_chunk
         repeat: until
         repeat-until: _.tag == 0xff or _io.eof
-        doc: >
-          Channel-major: one track per channel, then an end marker
-          (01 ff 00 00, formerly "the 4-byte trailer").
+        doc: One track per channel, then an end marker (01 FF 00 00).
 
   track_chunk:
-    doc: |
-      Half-width chunk header (u8 id, u8 tag, u16 length). The former
-      "01 01 separator" is a track header's id/tag bytes.
+    doc: Chunk with a 4-byte header (u8 id, u8 tag, u16 length).
     seq:
       - id: id
         type: u1
@@ -261,17 +208,16 @@ types:
     seq:
       - id: channel_index
         type: u1
-        doc: Sequential 0..channel_count-1.
+        doc: 0 to channel_count - 1, in order.
       - id: events
         size-eos: true
         type: events_body
 
   events_body:
     doc: |
-      `decode_events` in skmparse.py. `reserved` is this track's absolute
-      starting row and `last_row` its absolute ending row (Verified, 100%
-      corpus-wide) -- not consumed here as an offset; `tokens` remains in
-      on-the-wire/track-local order and consumers must apply the padding.
+      `reserved` is the track's first stored row and `last_row` its last,
+      both absolute. `tokens` are in stored order; the consumer places them
+      starting at row `reserved` and pads the rest of the pattern.
     seq:
       - id: last_row
         type: u1
@@ -283,25 +229,18 @@ types:
 
   row_token:
     doc: |
-      One row. Confirmed 2026-08-08 by a live cross-check against a paired
-      .xm export -- see PROVENANCE.md §6. Two grammars selected by
-      bit7 of `marker`:
+      One row. The marker byte selects the form:
 
-        * `marker == 0x80`: empty row, 1 byte, no payload.
-        * bit7 set (and marker != 0x80): COMPRESSED row. Low 5 bits of
-          `marker` select which fields follow, in ascending bit order:
-          bit0=effect_cmd(1B), bit1=note(1B), bit2=instrument(1B),
-          bit3=volume(2B), bit4=effect_param(1B). Every set bit's bytes
-          are always present (no bit0-dependency on bit4, unlike an
-          earlier, disproven model -- see skmparse.py's decode_events
-          docstring).
-        * bit7 clear: LITERAL row. `marker` itself IS the effect command
-          (not a bitmask), unconditionally followed by note(1B),
-          instrument(1B), volume(2B), effect_param(1B) -- mirroring XM's
-          own packed-cell convention.
+        * `0x80`: empty row.
+        * bit 7 set (not 0x80): compressed row. Bits 0-4 flag effect
+          command (1 byte), note (1), instrument (1), volume (2), and effect
+          parameter (1). Flagged fields follow in that order.
+        * bit 7 clear: literal row. The marker is the effect command, and
+          note, instrument, volume (2 bytes), and effect parameter always
+          follow.
 
-      The `*_effective` instances below collapse both grammars into one
-      logical field each; unset fields read back as -1.
+      The `*_effective` instances give one value per field for either form;
+      absent fields read as -1.
     seq:
       - id: marker
         type: u1
@@ -317,11 +256,11 @@ types:
       - id: compressed_volume0
         type: u1
         if: is_compressed and has_volume
-        doc: Plain-volume value when compressed_volume1 is 0; range 0..128 maps to tracker volume 0..64.
+        doc: Plain volume 0-128 when compressed_volume1 is 0 (halve for XM's 0-64).
       - id: compressed_volume1
         type: u1
         if: is_compressed and has_volume
-        doc: 0 selects the verified plain-volume family; 0x80 is the verified absent-volume sentinel.
+        doc: 0 = plain volume, 0x80 = no volume; other values unknown.
       - id: compressed_effect_param
         type: u1
         if: is_compressed and has_effect_param
@@ -363,12 +302,8 @@ types:
           (is_compressed and has_effect_cmd) ? compressed_effect_cmd.as<s4> : -1
       note_effective:
         doc: >
-          Raw on-disk value. 0..95 = musical pitches C-0..B-7; 0x81 = Note Off
-          (Verified). Under the verified two-mode event grammar, 0x80 occurs
-          0 times across all 239,260 note events in the workspace (the earlier
-          315-occurrence count in pre-2026-08-08 notes was a single-mode parser
-          artifact that misread literal-row bytes). The extended instrument
-          editor's Note Death Cut/Note Off policy is an instrument-level setting.
+          0-95 = C-0 to B-7; 0x81 = Note Off. No other value has been
+          observed.
         value: >
           is_literal ? literal_note.as<s4> :
           (is_compressed and has_note) ? compressed_note.as<s4> : -1
@@ -380,7 +315,7 @@ types:
         value: >
           is_literal ? literal_volume0.as<s4> + (literal_volume1.as<s4> << 8) :
           (is_compressed and has_volume) ? compressed_volume0.as<s4> + (compressed_volume1.as<s4> << 8) : -1
-        doc: Compatibility view of the two raw bytes as a little-endian integer.
+        doc: Both volume bytes as one little-endian integer.
       volume0_effective:
         value: >
           is_literal ? literal_volume0.as<s4> :
@@ -391,10 +326,10 @@ types:
           (is_compressed and has_volume) ? compressed_volume1.as<s4> : -1
       has_plain_volume:
         value: volume1_effective == 0 and volume0_effective >= 0 and volume0_effective <= 128
-        doc: Verified ordinary volume family; divide volume0_effective by 2 for a 0..64 tracker volume.
+        doc: Plain volume; halve volume0_effective for XM's 0-64.
       volume_is_absent:
         value: volume1_effective == 128
-        doc: Verified absent-volume sentinel; the varying first byte has no volume-column playback semantics.
+        doc: No volume; ignore the first byte.
       effect_param_effective:
         value: >
           is_literal ? literal_effect_param.as<s4> :
@@ -402,13 +337,9 @@ types:
 
   fx_chain_section:
     doc: |
-      Top-level tag 4. Verified byte-exact (zero slack) on all FX slots
-      corpus-wide -- see PROVENANCE.md §4. Structurally just another
-      generic chunk list (the same id/tag/length shape as the top-level
-      file), but with its own tag namespace -- a nested tag of 1 here
-      means "FX slot record", not "song_text" the way it would at the top
-      level, so this uses its own wrapper type (`fx_slot_chunk`) rather
-      than reusing the root `chunk` type.
+      Top-level tag 4. A chunk list with one record per FX slot. Tags in
+      this list have their own meaning (1 = FX slot), so it has its own
+      chunk type.
     seq:
       - id: slots
         type: fx_slot_chunk
@@ -419,10 +350,10 @@ types:
     seq:
       - id: id
         type: u2
-        doc: Observed 0x0002 for every populated slot.
+        doc: 2 for every populated slot observed.
       - id: tag
         type: u2
-        doc: Observed 0x0001 for every populated slot; 0xffff terminates the list (length 0).
+        doc: 1 for a slot; 0xffff (length 0) ends the list.
       - id: length
         type: u4
       - id: body
@@ -432,55 +363,47 @@ types:
 
   fx_slot_record:
     doc: |
-      One loaded FX-rack plugin. `slot_index` is the plugin's FX-rack
-      slot number -- sparse, not "position in this list" (empty slots
-      are omitted entirely; non-sequential slot records are observed).
-      `param_count` is an explicit on-disk field (unlike section 2's
-      pattern records, no offset arithmetic is needed here at all --
-      `params`'s length is simply `param_count`).
+      One FX plugin. `slot_index` is the rack slot, not the position in this
+      list; empty slots are omitted.
     seq:
       - id: slot_index
         type: u1
+        doc: 0-based; UI slot 01 is 0.
       - id: path
         type: strz
         encoding: ISO-8859-1
         doc: >
-          Full path or bare filename to the plugin DLL as seen by the
-          authoring install. Per PROVENANCE.md §3, only reliable
-          immediately after a fresh browse-load -- Skale itself collapses
-          this to `display_name` on the next save, so a format consumer
-          can't depend on it surviving a reload.
+          Plugin DLL path. Full only when the plugin was loaded from disk in
+          that session; after a reload and resave Skale writes the display
+          name here instead.
       - id: display_name
         type: strz
         encoding: ISO-8859-1
-        doc: The plugin's own self-reported name (effGetEffectName/effGetProductString).
+        doc: The plugin's own name.
       - id: loaded
         type: u1
-        doc: 0x01 in every instance seen so far; precise semantics remain unstressed.
+        doc: 1 in every observed file. Unknown.
       - id: mixer_volume
         type: f4
-        doc: Skale FX-strip fader. A 0.76 causal probe changed only this field from 0.8 to 3.0.
+        doc: FX strip fader.
       - id: wet_or_pan
         type: f4
-        doc: Commonly 0.5; observed to vary independently of mixer_volume.
+        doc: Usually 0.5. Probably the FX strip balance.
       - id: bypassed
         type: u1
-        doc: 0 when enabled and 1 after disabling the effect in the 0.76 causal probe.
+        doc: 0 enabled, 1 disabled.
       - id: param_count
         type: u4
       - id: params
         type: f4
         repeat: expr
         repeat-expr: param_count
-        doc: One float per automatable plugin parameter, in plugin parameter order.
+        doc: Plugin parameters, in plugin order.
 
   vsti_section:
     doc: |
-      Top-level tag 6. A clean Skale 0.81 mdaJX10 causal family verifies
-      one nested record per loaded synth slot. UI slot 01 is stored as
-      slot_index 0. Plugin parameters have an explicit count, followed by a
-      fixed 110-byte Skale-owned per-synth mixer strip (Verified across all
-      29/29 workspace VSTi records).
+      Top-level tag 6. A chunk list with one record per loaded synth. Empty
+      in most files.
     seq:
       - id: entries
         type: vsti_chunk
@@ -504,9 +427,11 @@ types:
     seq:
       - id: slot_index
         type: u1
+        doc: 0-based; UI slot 01 is 0.
       - id: path
         type: strz
         encoding: ISO-8859-1
+        doc: Same behavior as the FX slot path.
       - id: display_name
         type: strz
         encoding: ISO-8859-1
@@ -519,43 +444,38 @@ types:
       - id: skale_state
         size: 110
         type: vsti_skale_state
-        doc: Fixed 110-byte Skale-owned per-synth mixer strip (Sec 5.16, 29/29 exact).
+        doc: Skale's mixer strip for this synth.
       - id: trailing_bytes
         size-eos: true
         valid:
           expr: _.size == 0
-        doc: The fixed mixer strip must exhaust this bounded synth record.
+        doc: Must be empty; the mixer strip ends the record.
 
   vsti_skale_state:
-    doc: |
-      110-byte Skale-owned per-synth mixer strip in Section 6 (Verified across
-      all 29/29 workspace VSTi records and causal fixtures 63, 64, 66, 67, 68).
+    doc: Skale's 110-byte mixer strip for one synth.
     seq:
       - id: unknown_0
         type: u1
-        doc: 0x00 in all 29 observed records.
+        doc: Always 0.
       - id: send_knobs
         type: vsti_send_knob
         repeat: expr
         repeat-expr: 16
-        doc: >
-          16 x 6-byte send-knob records (flag, f32 value, u8 pad). Knob 0's
-          value is causally verified by singlevar/64, 66, 67, 68 (1.0 -> 2.125
-          / 2.5 / 0.0); knobs 0..7 are edited in singlevar/63.
+        doc: 16 send knobs. Knob 0 is the strip's first send knob.
       - id: bal
         type: f4
-        doc: Zero-centered in [-0.5, +0.5], default 0.0 (Verified, singlevar/63).
+        doc: -0.5 to +0.5, default 0.0.
       - id: volume_fader
         type: f4
-        doc: Default 1.0 (Verified, singlevar/63).
+        doc: Default 1.0.
       - id: sub_assign
         type: u1
         repeat: expr
         repeat-expr: 4
-        doc: SUB1..SUB4 routing booleans in {0, 1} (Verified, singlevar/63).
+        doc: SUB1-SUB4 assignment, 0 or 1.
       - id: mute_or_toggle
         type: u1
-        doc: Per-synth mixer strip 01 toggle in {0, 1} (Verified, singlevar/63).
+        doc: The strip's 01 toggle, 0 or 1.
 
   vsti_send_knob:
     seq:
@@ -568,20 +488,13 @@ types:
 
   global_section:
     doc: |
-      Top-level tag 5 (global/mixer). Fully Verified by causal Wine-GUI
-      drag/save/diff tests -- see PROVENANCE.md §5. Two on-disk
-      shapes, distinguished purely by the chunk's own length (already
-      known from the enclosing `chunk.length`, so no extra discriminant
-      field is needed): 4 bytes on 0.70-0.75 (just `master_volume`), 424
-      bytes in observed 0.76 files (adds the 4 SUB1-4 bus records and the FX-bus
-      cross-send matrix). `mixer` reads immediately following
-      `master_volume` in the same stream, so its own internal offsets
-      (SUB buses at 4-135, FX matrix at 136-423) fall out naturally with
-      no manual arithmetic.
+      Top-level tag 5. Two sizes: 4 bytes when the header stamp is below
+      7600 (master volume only), 424 bytes when it is 7600 (adds SUB1-4 and
+      the FX-bus send matrix at offsets 4-135 and 136-423).
     seq:
       - id: master_volume
         type: f4
-        doc: The overall song master fader (Verified) -- not to be confused with a same-named but unrelated per-plugin VSTi parameter found elsewhere (section 6).
+        doc: Song master fader. Probable for the 4-byte form.
       - id: mixer
         type: global_mixer_ext
         if: _io.size == 424
@@ -592,22 +505,19 @@ types:
         type: sub_bus_record
         repeat: expr
         repeat-expr: 4
-        doc: SUB1-4, in fixed order.
+        doc: SUB1-4, in order.
       - id: fx_bus_matrix
         type: fx_bus_send(_index)
         repeat: expr
         repeat-expr: 32
-        doc: 8 source buses x 4 send slots each, see fx_bus_send.source_bus/slot.
+        doc: 8 source buses × 4 sends.
 
   sub_bus_record:
-    doc: 33 bytes. Every field independently confirmed by an isolated causal drag/click test (PROVENANCE.md §5); SUB2-4 confirmed to share SUB1's exact layout, not just assumed by symmetry.
+    doc: 33 bytes. SUB1-4 share this layout.
     seq:
       - id: flag0
         type: u1
-        doc: >
-          0 normally; its exact semantic role is inferred from `knobs[].pad`'s
-          confirmed behavior (same shape, same kind of toggle) rather than
-          independently drag-tested -- Probable, not Verified.
+        doc: Usually 0. Unknown; possibly a toggle like knobs[].pad.
       - id: fader
         type: f4
         doc: Default 1.0.
@@ -618,27 +528,24 @@ types:
         type: sub_bus_knob
         repeat: expr
         repeat-expr: 4
-        doc: One per the mixer's fixed "01".."04" send knobs, label N == 0-based index N-1.
+        doc: Send knobs 01-04, in order.
 
   sub_bus_knob:
     doc: 6 bytes.
     seq:
       - id: pad
         type: u1
-        doc: 0 normally, 1 when the knob's own small LED/dot is clicked (Verified).
+        doc: 1 when the knob's LED is clicked, otherwise 0.
       - id: value
         type: f4
         doc: Default 1.0.
       - id: index
         type: u1
-        doc: 0,1,2,3 -- always in fixed order corpus-wide (unlike the FX matrix's re-routable target_bus).
+        doc: 0-3, always in order.
 
   fx_bus_send:
     doc: >
-      9 bytes. An FX bus's own fader/balance are NOT stored here -- a
-      causal test dragging both, once a plugin was loaded into the slot,
-      touched section 4's mixer_volume/wet_or_pan fields instead (see
-      fx_slot_record), leaving this matrix untouched.
+      9 bytes. An FX bus's own fader and balance are in section 4, not here.
     params:
       - id: idx
         type: s4
@@ -646,10 +553,8 @@ types:
       - id: enabled_flag
         type: u1
         doc: >
-          Named on a corpus-wide hunch, not a causal test (Probable): 0 in
-          every untouched corpus slot, but also 0 in this session's own
-          causal test after editing send_level, so editing the knob alone
-          doesn't set it. Does turn up 1 on real-world songs.
+          Usually 0, sometimes 1. Unknown; changing the send level alone
+          leaves it 0.
       - id: target_bus_raw
         type: u4
       - id: send_level
@@ -661,14 +566,12 @@ types:
         value: idx % 4
       target_bus:
         value: "target_bus_raw == 0xffffffff ? -1 : target_bus_raw.as<s4>"
-        doc: -1 (from the on-disk 0xffffffff sentinel) means unset.
+        doc: -1 means no target.
 
   instruments_section:
     doc: |
-      Top-level tag 3. Per-instrument nested chunk list, same shape as
-      `fx_chain_section` -- but, again, `tag`'s meaning here (1 = a real
-      instrument record, 0xffff = terminator) is local to this list, so
-      it gets its own wrapper type rather than reusing the root `chunk`.
+      Top-level tag 3. A chunk list with one record per instrument. The
+      chunk ID is the record version.
     params:
       - id: version_raw
         type: u4
@@ -696,11 +599,10 @@ types:
 
   instrument_record:
     doc: |
-      Instrument chunk ID is its record version. IDs 3/4 use 128 direct
-      keymap bytes; IDs 5/6 use 128 variable-length framed entries. The
-      settings block is 401, 284, 284, or 288 bytes respectively. The first
-      96 keymap entries correspond to playable notes. Unknown versions keep
-      their bounded remainder raw; the file header alone cannot select layout.
+      Record versions 3/4 have 128 one-byte keymap entries; 5/6 have 128
+      framed entries. The settings block is 401, 284, 284, or 288 bytes for
+      versions 3-6. The first 96 keymap entries are the playable notes.
+      Other versions are kept as raw bytes.
     params:
       - id: version_raw
         type: u4
@@ -735,10 +637,9 @@ types:
 
   keymap_entry:
     doc: |
-      `00 00` (unmapped) or `01 01 <slot> 00 7F 00` in every observed file.
-      Read as flag + layer count + 4-byte layers (Sec 5.15); that the second
-      byte is a count and the 00/7F pair a range is Conjecture, so layer
-      bytes beyond the slot are kept raw.
+      Always `00 00` (unmapped) or `01 01 <slot> 00 7F 00` in observed
+      files. Read as flag, layer count, and 4-byte layers. The count reading
+      is Probable, so layer bytes after the slot are kept raw.
     seq:
       - id: flag
         type: u1
@@ -764,9 +665,10 @@ types:
         type: u1
       - id: layer_raw
         size: 3
-        doc: Observed constant 00 7F 00.
+        doc: Always 00 7F 00.
 
   instrument_settings:
+    doc: Offsets in field names are from the start of the settings block.
     params:
       - id: record_version
         type: u2
@@ -781,24 +683,25 @@ types:
         type: u1
       - id: note_death
         type: u1
+        doc: 0 = Cut, 1 = Note Off.
       - id: volume_fader
         type: f4
       - id: bal
         type: f4
       - id: unknown_17
         size: 8
-        doc: Zero in every observed record.
+        doc: Always zero.
       - id: table_25
         size: 64
         doc: >
-          Identity (entry i == i) in 1777/1793 corpus records; the only
-          deviations remap entry 7 to 16 or 17. Meaning unidentified.
+          Almost always the identity map (entry i == i). The only exceptions
+          seen remap entry 7 to 16 or 17. Unknown.
       - id: u8_89
         type: u1
         doc: >
-          Offsets 89-125 are a probable instrument-filter block (Conjecture,
-          Sec 5.15): defaults 5000/5000/50/0.5/0.5/0/10, edited floats move
-          in steps of 1/42 of their default, u8_122 is a 1/2/4/6/7 bitmask.
+          Start of offsets 89-125, which are probably the instrument filter.
+          Defaults are 5000, 5000, 50, 0.5, 0.5, 0, and 10; u8_122 is a bit
+          mask. Unknown.
       - id: f32_90
         type: f4
       - id: f32_94
@@ -824,28 +727,25 @@ types:
       - id: ext_synth_mode
         type: u1
         doc: >
-          Instr. Ed. Ext. mode (Sec 5.16), named by correlation only: 1 on all
-          13 distinct VSTi-linked instrument records observed, 0 elsewhere.
-          No causal save has changed it.
+          1 on every VSTi-linked instrument, 0 otherwise. Probable; no save has
+          changed it on its own.
       - id: vsti_device
         type: u1
-        doc: >
-          0-based Section 6 VSTi synth slot index (Verified, singlevar/46:
-          Device 01 -> 0, Device 02 -> 1).
+        doc: 0-based section 6 synth slot (Device 01 is 0).
       - id: unknown_128
         size: 2
       # ID 3 (0.70-0.75) tail: 1 + 7 + 1 + 16 x 13 + 54 = 271 bytes.
       - id: legacy_byte_130
         type: u1
         if: record_version == 3
-        doc: 0xFF in every observed record.
+        doc: Always 0xFF.
       - id: legacy_unknown_131
         size: 7
         if: record_version == 3
       - id: legacy_byte_138
         type: u1
         if: record_version == 3
-        doc: 0x7F in every observed record.
+        doc: Always 0x7F.
       - id: legacy_send_knobs
         type: legacy_send_knob
         repeat: expr
@@ -854,7 +754,7 @@ types:
       - id: legacy_tail_raw
         size: 54
         if: record_version == 3
-        doc: Zero except u32 1 at block offsets 364 and 368.
+        doc: Zero except for u32 value 1 at block offsets 364 and 368.
       # IDs 4-6.
       - id: unknown_130
         size: 2
@@ -862,46 +762,38 @@ types:
       - id: unknown_132
         size: 16
         if: record_version != 3
-        doc: All 0xFF in every observed record.
+        doc: Always 0xFF.
       - id: unknown_148
         type: u1
         if: record_version != 3
       - id: vsti_device_enabled
         type: u1
         if: record_version != 3
-        doc: >
-          Instr. Ed. Ext. Device enable light in {0, 1} (Verified, singlevar/37
-          vs 45 and 46 vs 47).
+        doc: The extended editor's device enable light, 0 or 1.
       - id: unknown_150
         size: 2
         if: record_version != 3
       - id: byte_152
         type: u1
         if: record_version != 3
-        doc: >
-          0 in 1324/1325 records, 12 in VANGard.skm instrument 1 (formerly
-          mislabeled toggle01_companion due to a -136 vs -36 offset typo).
+        doc: Almost always 0. Unknown.
       - id: unknown_153
         size: 2
         if: record_version != 3
       - id: byte_155
         type: u1
         if: record_version != 3
-        doc: 0x7F in all but one observed record (0 in VANGard.skm instrument 0).
+        doc: Almost always 0x7F. Unknown.
       - id: send_knobs
         type: send_knob
         repeat: expr
         repeat-expr: 16
         if: record_version != 3
-        doc: >
-          Knob 0 is the GUI-verified FX-send "01" knob (singlevar/50);
-          knobs 8-15 are never edited in the corpus.
+        doc: Knob 0 is the mixer's first send knob; knobs 8-15 have no visible control.
       - id: toggle01_companion
         type: u1
         if: record_version != 3
-        doc: >
-          Verified via singlevar/60_instrument_toggles.skm (sample_list_start - 36
-          in ID 6): equals 1 - toggle01 across 1325/1325 records in IDs 4-6.
+        doc: Always 1 - toggle01.
       - id: sub_assign
         type: u1
         repeat: expr
@@ -935,9 +827,8 @@ types:
 
   legacy_send_knob:
     doc: >
-      ID 3 knob record; flag/value match the ID 6 resave of the same song
-      1392/1392 (Sec 5.15). The two trailing floats are 0.0 and 1.0 in
-      every observed record.
+      Record version 3 send knob. flag and value match the same song resaved
+      as version 6. aux_a and aux_b are always 0.0 and 1.0.
     seq:
       - id: flag
         type: u1
@@ -959,10 +850,8 @@ types:
 
   instrument_nested_list:
     doc: |
-      The generic id/tag/length chunk-list shape, one more time. Populated
-      sample slots (id=1, tag=1) are followed by 32 variable-length envelope
-      sub-chunks (id=2 in record versions 3/4, id=3 in record versions 5/6;
-      tag=2) forming an 8x4 grid (row 0..7 x col 1..4), closed by EOF.
+      Sample slots (id 1, tag 1) and 32 envelope chunks (tag 2; id 2 in
+      record versions 3/4, id 3 in 5/6), closed by EOF.
     seq:
       - id: entries
         type: generic_chunk
@@ -970,9 +859,7 @@ types:
         repeat-until: _.tag == 0xffff or _io.eof
 
   generic_chunk:
-    doc: |
-      A nested instrument chunk: tag=1 (id=1) is a sample slot; tag=2
-      (id=2 or 3) is one of the 32 envelope grid sub-chunks; tag=0xffff is EOF.
+    doc: tag 1 is a sample slot, tag 2 an envelope, tag 0xffff EOF.
     seq:
       - id: id
         type: u2
@@ -990,12 +877,10 @@ types:
 
   instrument_envelope_subchunk:
     doc: |
-      One slot in the 8x4 per-instrument envelope grid (Verified, 57,376/57,376
-      corpus sub-chunks exact, Sec 5.16). `row` is 0..7 (steps A..H, where 0 is
-      the active step A and 1..7 are presets B..H); `col` is 1..4 (1 = volume,
-      2 = panning, 3 and 4 = two additional instrument envelopes). Length is
-      `9 + 4 * num_points` when chunk_id == 2 (record versions 3/4) and
-      `10 + 4 * num_points` when chunk_id == 3 (record versions 5/6).
+      One cell of the instrument's 8 × 4 envelope grid. `row` 0-7 is step
+      A-H (0 is the active step A). `col` 1-4 is volume, panning, and two
+      unidentified envelopes. Length is `9 + 4 * num_points` for chunk id 2
+      and `10 + 4 * num_points` for chunk id 3.
     params:
       - id: chunk_id
         type: u2
@@ -1034,7 +919,7 @@ types:
         type: u2
 
   sample_subchunk:
-    doc: Fourteen metadata bytes after the slot/name, then audio chunks and EOF.
+    doc: Slot number, name, 14 metadata bytes, then an audio chunk list.
     seq:
       - id: local_slot
         type: u1
@@ -1050,9 +935,9 @@ types:
 
   sample_audio_chunk:
     doc: |
-      Populated slots have one tag=1 audio chunk followed by EOF. Empty
-      slots have EOF alone. Preserve terminal header values for semantic
-      validation, including fixtures with damaged EOF bytes.
+      A populated slot has one tag 1 audio chunk, then EOF. An empty slot has
+      only EOF. EOF header values are kept as read so a validator can check
+      them.
     seq:
       - id: format
         type: u2
@@ -1069,12 +954,12 @@ types:
     seq:
       - id: stored_value_count
         type: u4
-        doc: Total interleaved sample values, not per-channel frames.
+        doc: Total interleaved values; divide by channels for frames.
       - id: channels
         type: u1
       - id: payload
         size-eos: true
-        doc: PCM bytes or u32 Ogg inner length plus the Ogg stream; excludes EOF.
+        doc: PCM data, or a u32 Ogg inner length followed by the Ogg stream.
     instances:
       ogg:
         pos: 5
@@ -1084,12 +969,11 @@ types:
 
   ogg_payload:
     doc: |
-      The inner length is self-inclusive: it counts its own four bytes plus
-      the stream, which ends exactly at the audio chunk's end (1032/1032,
-      Sec 5.15). Older notes called this an overcount into the EOF header.
-      Consumers require inner_length == stream.size + 4, OggS magic, and a
-      valid following EOF.
-      This lazy view leaves malformed payloads inspectable at container level.
+      `inner_length` counts its own four bytes plus the stream, and the
+      stream ends at the end of the audio chunk. A validator should require
+      inner_length == stream.size + 4, `OggS` magic, and a valid EOF after
+      the chunk. This view is lazy, so a bad payload does not stop the rest
+      of the file from parsing.
     seq:
       - id: inner_length
         type: u4
@@ -1097,26 +981,27 @@ types:
         size-eos: true
 
   sample_metadata:
-    doc: Verified fixed header immediately following a populated sample name.
+    doc: The 14 bytes after a sample's name.
     seq:
       - id: volume
         type: u1
-        doc: Stored byte is displayed directly in hexadecimal by Skale; 0x80 is unity, 0x40 is one-half linear gain, and 0x00 is silence (Verified).
+        doc: Shown in hex by Skale. 0x80 is unity, 0x40 half linear gain, 0x00 silent.
       - id: panning
         type: u1
-        doc: Stored byte is displayed directly in hexadecimal by Skale; 0x80 is center and 0x00 is hard left (Verified). The opposite endpoint is not yet established by a public causal fixture.
+        doc: Shown in hex by Skale. 0x80 is centre, 0x00 hard left; right endpoint untested.
       - id: finetune
         type: s1
       - id: relative_note
         type: s1
       - id: unknown_a
         type: u1
+        doc: 8 or 16. Unknown.
       - id: loop_start
         type: u4
-        doc: Absolute sample-frame position; full width causally verified with values above 0xffff and below 0x100.
+        doc: Absolute sample frame.
       - id: loop_end
         type: u4
-        doc: Absolute sample-frame position, not a loop length.
+        doc: Absolute sample frame, not a length.
       - id: loop_type
         type: u1
         enum: sample_loop_type

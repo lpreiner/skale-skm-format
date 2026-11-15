@@ -83,9 +83,9 @@ class ReferenceParserSmokeTests(unittest.TestCase):
 
 
     def test_ogg_padding_is_four_bytes(self):
-        """Skale pads Ogg streams with `01 00 FF FF`, and all four must be
-        excluded. Leaving `01 00` in place is enough to hang a push-mode
-        Vorbis decoder (FORMAT.md, section 3)."""
+        """The four bytes after an Ogg stream, `01 00 FF FF`, are the EOF
+        header and must not reach the decoder. Leaving `01 00` in place can
+        hang a push-mode Vorbis decoder (FORMAT.md, section 3)."""
         import struct
 
         checked = 0
@@ -105,16 +105,16 @@ class ReferenceParserSmokeTests(unittest.TestCase):
                     stream = self.parser.extract_ogg_stream(raw, sample)
                     self.assertEqual(stream, stored[:-4], name)
                     self.assertEqual(stream[:4], b"OggS", name)
-                    # The returned stream must not end in any of the padding.
+                    # The returned stream must not include any EOF header bytes.
                     self.assertNotEqual(stream[-2:], b"\xff\xff", name)
                     self.assertNotEqual(stream[-2:], b"\x01\x00", name)
                     checked += 1
         self.assertGreater(checked, 0)
 
     def test_ogg_padding_validation_rejects_mutated_padding(self):
-        """The negative fixture keeps its container framing but breaks the
-        padding, so the container parses and only the stream extraction
-        rejects it."""
+        """The fixture keeps its chunk lengths but damages the EOF bytes
+        after the Ogg stream, so the container parses and only stream
+        extraction rejects it."""
         import struct
 
         path = (ROOT / "tests" / "fixtures" / "generated"

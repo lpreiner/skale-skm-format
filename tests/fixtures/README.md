@@ -31,14 +31,13 @@ mutation, not whether the payload is meaningful.
   `ogg-missing-ff-padding` are all same-size in-place byte rewrites of an
   authentic fixture: they still consume 17701/17701 bytes, and it is
   `extract_ogg_stream`, not `parse_skm`, that rejects them.
-- `reject` — the framing itself is broken and no honest parser can continue.
-  `truncated-inside-ogg-stream` removes 1740 bytes, leaving a chunk that
-  declares 16804 bytes with 15536 available.
+- `reject` — the container framing is broken, so the container parser must
+  reject the file. `truncated-inside-ogg-stream` removes 1740 bytes, leaving a
+  chunk that declares 16804 bytes with 15536 available.
 
-This split is deliberate, and consumers are expected to preserve it. A module
-with one corrupt sample should still load and expose its remaining samples,
-with the bad one skipped; refusing an entire module over a few payload bytes is
-both less useful and a liability for a library that parses untrusted input.
+Container parsing and payload validation are separate checks. If a sample
+payload is corrupt but its chunk boundaries are intact, a consumer should
+skip that sample and continue reading the remaining samples.
 
 ## Adding a fixture
 

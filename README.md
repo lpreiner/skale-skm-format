@@ -2,112 +2,106 @@
 
 # skale-skm-format
 
-This project documents the `.skm` module format written by Skale Tracker and
-provides an independent reference parser, a Kaitai Struct description, and a
-small redistribution-safe test corpus.
+A description of the `.skm` module format written by Skale Tracker, with a
+reference parser in Python, a Kaitai Struct schema, and a small test corpus
+that is safe to redistribute.
 
 Canonical repository: <https://github.com/lpreiner/skale-skm-format>
 
-The format was reverse-engineered by observing files, comparing controlled
-single-variable saves, using Skale's documented behavior and paired exports,
-and validating structural invariants across a private research corpus. The
-Skale executable was not disassembled, decompiled, or debugged.
+## How the format was worked out
 
-## Project status
+Everything here comes from the files Skale writes. Most claims rest on
+controlled saves: change one setting in Skale, save, and diff against the
+previous file. Comparing the SKM file with Skale's XM export of the same song
+helps identify fields shared by both formats. The Skale executables were run
+as applications only. They were not disassembled, decompiled, or debugged, and
+they are not distributed here.
 
-The container, song metadata, order list, pattern framing, channel-major event
-encoding, common instrument/sample records, PCM and embedded Ogg payloads,
-keymaps, principal envelopes, and the 0.76 global mixer section are documented.
-Instrument chunk IDs select all observed keymap/settings layouts declaratively. VST2
-FX records and the counted VSTi parameter prefix are covered by rights-safe
-fixtures; plugin-specific meanings and Skale's VSTi routing tail remain
-intentionally incomplete.
+A private collection of third-party songs was used to check that layouts hold
+across real-world files. Those songs are not distributed. Where a claim rests
+only on them, `PROVENANCE.md` says so.
 
-This project's specification is partial and its parser interfaces are not yet
-declared stable. A successful structural parse does not imply that every
-optional or plugin-specific field is understood.
+## Status
 
-Authentic application evidence currently covers Skale 0.70, 0.71, 0.75,
-0.76, 0.80, 0.802, and 0.81. Versions 0.72–0.74 and 0.77–0.79 were not
-available and are not claimed as tested. The observed serialized header
-values are 7000, 7100, 7500, and 7600; applications 0.80, 0.802, and 0.81
-continue to stamp 7600 despite structural changes.
+| Part | Status |
+|---|---|
+| Chunk container, file header | Verified |
+| Section 1: title, message, initial BPM/speed/channels | Verified; non-ASCII encoding open |
+| Section 2: order list, patterns, event encoding | Layout verified; stored parameters for effects `10`–`13` and volume-column values other than plain volume or no volume remain unconfirmed |
+| Section 3: instruments, keymaps, envelopes, samples (PCM8/PCM16/Ogg) | Layout verified for all observed record versions; some settings fields unnamed |
+| Section 4: VST effect chain | Layout verified; plugin parameters are plugin-specific |
+| Section 5: master volume, sub-buses, FX-bus sends | Verified for the 0.76 layout |
+| Section 6: VSTi synths | Layout verified; plugin parameters are plugin-specific |
 
-## Method and evidence
+The parser's interfaces are not yet stable. A file that parses cleanly may
+still contain fields whose meaning is unknown.
 
-Format claims come from controlled Skale saves, single-variable comparisons,
-paired XM exports, deterministic CC0 sample inputs, and structural invariants.
-The fixture manifest is the public evidence index. Skale executables were used
-only as applications and are neither analyzed nor redistributed.
+Tested Skale versions: 0.70, 0.71, 0.75, 0.76, 0.80, 0.802, and 0.81.
+The observed file-header values are
+7000, 7100, 7500, or 7600; 0.80, 0.802, and 0.81 all write 7600 even though
+their instrument records differ. Read the instrument record's own chunk ID to
+tell them apart, not the header.
 
-Private third-party songs contributed to early exploration but are not needed
-by the public tests and are not distributed. Conclusions supported only by
-private observations remain explicitly qualified in `FORMAT.md` until public
-causal evidence replaces them. In particular, consumers must distinguish the
-serialized version stamp from the authoring application and total interleaved
-sample values from per-channel audio frames.
+## Help wanted: example files
+
+Several open questions can be settled with a single small file saved from
+Skale. [`EXAMPLES_NEEDED.md`](EXAMPLES_NEEDED.md) lists each one with the
+exact steps to produce it. If you have a working copy of Skale, that list is
+the most useful place to start.
 
 ## Repository contents
 
-- `FORMAT.md`: current format description organized in on-disk order.
-- `PROVENANCE.md`: evidence and confidence record.
-- `kaitai/skm.ksy`: declarative Kaitai Struct parser.
-- `reference/skmparse.py`: independent parser and semantic verifier.
-- `tests/fixtures/`: compact fixtures with explicit redistribution rights.
-- `corpus/third-party-manifest.json`: factual hashes identifying the Skale
-  executables used for authoring; no executable or third-party module is
-  redistributed.
+- `FORMAT.md`: the format, in on-disk order.
+- `PROVENANCE.md`: the evidence behind each claim.
+- `EXAMPLES_NEEDED.md`: open questions and the example files that would close
+  them.
+- `kaitai/skm.ksy`: Kaitai Struct schema.
+- `reference/skmparse.py`: reference parser and verifier (Python 3, standard
+  library only).
+- `tests/fixtures/`: test files, each with recorded origin and license.
+- `corpus/third-party-manifest.json`: hashes of the Skale executables used to
+  author the fixtures.
+- `docs/CHANGELOG.md`: history of corrections to the format description.
 
-## Corpus policy
+## Test files
 
-Copyrighted scene music is not included. Public fixtures must be wholly
-authored for this project and contain only deterministic generated audio under
-an explicit redistribution-safe license. Each fixture records its creator,
-inputs, creation method, SHA-256, license, authenticity classification, and
-coverage purpose.
+No third-party songs are included. Every fixture was made for this project
+from generated audio, and `tests/fixtures/manifest.json` records who made it,
+how, from what inputs, and under what license. Fixtures fall into four
+classes:
 
-Fixtures are classified as:
+- **authentic**: saved by Skale;
+- **synthetic**: built by a script from the documented format;
+- **template-rewritten**: a script's edit of an authentic file;
+- **malformed**: deliberately broken, for testing error handling.
 
-- **authentic**: saved by Skale from rights-safe inputs;
-- **synthetic**: constructed from the documented format;
-- **template-rewritten**: derived automatically from an authentic safe seed;
-- **malformed**: deliberately invalid input for boundary testing.
+Authentic saves show what Skale writes. Synthetic or modified files show
+what Skale accepts only when a load test is recorded. They also test parsers.
 
-Synthetic fixtures test consumers; only authentic Skale saves are used as
-evidence for what Skale itself emits or accepts.
-
-## Independence from players
-
-The specification describes stored SKM values directly and has no dependency
-on OpenMPT or another playback engine. Player-specific mappings and loaders
-belong in separate projects.
-
-## Licensing
-
-The public license split is CC0-1.0 for the Kaitai spec, generated audio,
-approved fixtures, expected results, and corpus metadata; BSD-2-Clause for
-code; and CC-BY-4.0 for documentation. See `LICENSE_POLICY.md`. Hash-only
-metadata does not grant rights to third-party modules, and no such module is
-distributed here.
+The format description does not depend on OpenMPT or any other player.
+Player-specific loaders belong in their own projects.
 
 ## Quick start
 
 ```sh
 python3 reference/skmparse.py --json tests/fixtures/authentic/empty-skale-076-first.skm
+python3 -B -m unittest discover -s tests -p 'test_*.py'
 python3 tools/validate_public_tree.py .
-python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
-To repeat the independent instrument-layout and generated-parser comparison:
+To check the Kaitai schema against the reference parser:
 
 ```sh
 kaitai-struct-compiler -t python --outdir /tmp/skm-generated kaitai/skm.ksy
-# Run with Python containing the official kaitaistruct 0.11 runtime.
 python tools/check_instrument_layouts.py tests/fixtures/authentic --generated-dir /tmp/skm-generated
 ```
 
-The checker accepts additional file/directory arguments for a private corpus.
-Deliberate container-truncation fixtures must be tested separately as rejects.
-Known malformed Ogg payloads are counted and must fail extraction while their
-containers remain inspectable. `FORMAT.md` documents the updated Section 3
-fields and compatibility aliases; regenerated Kaitai types use the new layout.
+This needs the `kaitaistruct` 0.11 Python runtime. The checker also accepts
+extra files or directories, so you can run it over your own songs.
+
+## Licensing
+
+Code is BSD-2-Clause. Documentation is CC-BY-4.0. The Kaitai schema,
+fixtures, generated audio, and metadata are CC0-1.0. See `LICENSE_POLICY.md`
+for details. Nothing here grants rights to Skale itself or to any third-party
+song.

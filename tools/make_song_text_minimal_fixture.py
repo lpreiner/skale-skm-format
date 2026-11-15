@@ -17,8 +17,7 @@ property that matters.
 The trailer is preserved byte-for-byte, so the channel-count and version
 cross-checks against sections 2 and the header still hold.
 
-A consumer that reserves a fixed 10-byte footer (the pre-2026-08-25 model)
-rejects this file outright; one anchored on the trailer reads it as an
+A consumer that reserves a fixed 10-byte footer rejects this file outright; one anchored on the trailer reads it as an
 empty title and empty message.
 """
 from __future__ import annotations

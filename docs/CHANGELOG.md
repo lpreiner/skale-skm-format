@@ -1,80 +1,64 @@
 <!-- SPDX-License-Identifier: CC-BY-4.0 -->
 
-# Interpretation history
+# Changelog
+
+Changes to the format description, newest first. Corrections say what the
+earlier reading was.
 
 ## Unreleased — initial public repository
 
-- Section 6: the bytes after a VSTi's counted plugin parameters are a fixed
-  110-byte per-synth mixer strip (16 send knobs, BAL, fader, SUB assign, a
-  toggle). Kaitai rejects shorter or longer strips.
-- The 32 `tag=2` instrument sub-chunks form one 8 × 4 grid (steps A..H ×
-  volume, panning and two further envelopes) with one variable-length layout.
-- `toggle01_companion` moved from settings +152 to +252, where it is always
-  `1 - toggle01`. +127 and +149 are the VSTi device index and enable flag; +126
-  is named by correlation only.
-- Note value `0x80` never occurs under the two-mode row grammar; it is removed
-  from the open questions.
-- Read section 2 as chunk lists: pattern chunks, half-width track chunks, and
-  their end markers account for every former unknown/separator/trailer byte.
-  The pattern row count is a `u16` (Skale writes 256 as `00 01`); the
-  synthetic 256-row fixture was regenerated to match.
-- Framed keymap entries are parsed as flag + layer count + layers. Unexpected
-  layer bytes are preserved rather than failing the file, and `keymap_mapped`
-  separates unmapped entries from explicit slot-0 mappings.
-- Decoded the 16 send-knob records for every instrument record version, and
-  mapped the rest of the settings blocks structurally.
-- Described the Ogg inner length as self-inclusive (no change to validation).
-- Resolved instrument chunk IDs as record versions; decode 128 direct or
-  variable-length keymap entries and versioned settings blocks in Python and
-  Kaitai. Added sample-less instrument support and regression coverage for all
-  observed prefix lengths; known malformed keymaps no longer trigger scanning.
-- Corrected sample framing to 14 metadata bytes plus an inner audio chunk list
-  and EOF. The former Ogg padding is part of EOF; stream extraction stays inside
-  its audio chunk while validating the historical inner-length overcount.
-- Corrected older mixer EQ offsets using the 284/288-byte settings lengths and
-  retained the nonboolean companion field as a raw value.
-- Established redistribution-safe fixtures for application versions 0.70,
-  0.71, 0.75, 0.76, 0.80, 0.802, and 0.81.
-- Distinguished direct and framed instrument keymap/prefix layouts despite
-  shared serialized version values.
-- Verified PCM8, PCM16, stereo interleaving, Ogg framing, loop types, primary
-  envelopes, Note Off, Note Death policy, sample volume/pan, and direct-layout
-  mixer fader/BAL fields.
-- Added rights-safe VST2 effect and VSTi fixture families, verified zero-based
-  stored slot indices, FX mixer-volume and bypass fields, counted VSTi plugin
-  parameters, and deterministic reload/resave behavior.
-- Kept pattern note value `0x80` unidentified; instrument Note Death policy is
-  not evidence that it represents pattern Note Cut.
-- Corrected loop-point interpretation after confirming that Skale's editor
-  displays those values in hexadecimal.
-- Corrected embedded-Ogg padding from two bytes to four. Every observed stream
-  ends `01 00 FF FF` inside the stored inner length (1032/1032 corpus samples,
-  3/3 public fixtures); the earlier reading recognised only the trailing
-  `FF FF`. Excluding just two bytes leaves `01 00` after the real Ogg EOS,
-  which is enough to make a push-mode Vorbis decoder consume nothing while
-  reporting "need more data" — hanging a length-driven read loop after the
-  audio has already been fully decoded. Excluding all four is lossless;
-  decoded sample counts are identical.
-- Anchored the song-text message on the 8-byte trailer instead of reserving a
-  fixed ten-byte footer. The footer is fixed-width in Skale's own output, but
-  reserving it truncated the message of any structurally valid file whose
-  trailing NUL run is shorter, and requiring it to be zero rejected such files
-  outright. Added `song-text-short-padding.skm` and lowered the minimum section
-  size from 18 bytes to 9 (a title terminator plus the trailer), pinned by
-  `song-text-minimal.skm`. `zero_footer_raw` now reports `null` when the
-  canonical footer region does not exist, rather than a truncated slice.
-- Made the song-text separator conditional. It is absent in some structurally
-  valid files, and consuming it unconditionally swallowed the first character
-  of the message; the Kaitai schema did this and disagreed with the reference
-  parser on every such file. Both now agree across the whole test corpus.
-- Kept the Kaitai schema's Ogg framing decode out of container parsing. Sizing
-  a field from the untrusted inner length made a declared-bad length fail at
-  the container layer, contradicting the documented split where framing damage
-  is the container's to reject and payload damage belongs to validation. The
-  framing is now a lazy `ogg` instance; evaluating it is the validation step.
-- Documented what `expected_parse` means in the fixture manifest: whether the
-  container framing survives the mutation, not whether the payload is
-  meaningful.
-- Stopped `validate_public_tree.py` writing `__pycache__` while loading the
-  reference parser. It did so after its own tree walk, so it passed on the run
-  that created the cache and failed on the next one against an unchanged tree.
+### Format
+
+- Added the effect-command table (`00`–`13`) from Skale's Help, with a status
+  for each command. `10`–`13` scaling and the `0F` threshold are open.
+- Documented the two volume-column bytes: second byte `00` is a plain volume,
+  `80` is no volume, other values are unknown.
+- Section 6: a synth record ends in a fixed 110-byte mixer strip after its
+  plugin parameters.
+- Section 3: the 32 envelope chunks per instrument form one 8 × 4 grid with a
+  single layout.
+- **Correction:** `toggle01_companion` is at settings `+252`, not `+152`.
+  `+127` and `+149` are the VSTi device index and enable flag. `+126` is
+  named by correlation only.
+- **Correction:** note value `0x80` does not occur. Earlier counts came from a
+  parser that predated the two-mode row grammar. Only `0x81` (Note Off) is a
+  special note value.
+- **Correction:** pattern `rows` is a `u16`; Skale writes 256 as `00 01`. It was
+  read as a `u8` with 0 meaning 256. Pattern and track records are chunk lists;
+  the bytes once described as a reserved word, separators, and a trailer are
+  their headers and end markers. The synthetic 256-row fixture was regenerated.
+- **Correction:** the instrument chunk ID is the record version (3–6) and
+  selects the keymap and settings layout. Earlier versions of this document
+  located the sample list by searching.
+- Framed keymap entries are read as flag, layer count, and layers. Unmapped
+  entries are reported separately from slot-0 mappings.
+- Mapped the settings blocks, including the 16 send knobs in every record
+  version.
+- **Correction:** the older EQ offsets were four bytes out of alignment, which
+  made some files look like they had two EQ bands. All files have three.
+- **Correction:** a sample is 14 metadata bytes followed by an inner chunk list
+  and EOF. The earlier 27-byte header and 3-byte trailer were this framing
+  misread.
+- **Correction:** the Ogg `inner_length` counts itself. The four bytes once
+  called "Ogg padding" (first read as two) are the following EOF header.
+  Passing them to a Vorbis decoder can stall it.
+- **Correction:** loop points are stored as the hex values Skale's editor
+  displays.
+- **Correction:** song text is read from both ends. The ten-byte footer is not
+  reserved, and the separator after the title is optional; both earlier
+  assumptions truncated or rejected valid files.
+- Note Death (Cut / Note Off) is an instrument setting, not a pattern
+  encoding.
+- Added fixtures from Skale 0.70, 0.71, 0.75, 0.76, 0.80, 0.802, and 0.81,
+  covering PCM8, PCM16, stereo, Ogg, loops, envelopes, Note Off, Note Death,
+  sample volume and panning, mixer fader and BAL, VST2 effects, and VSTi
+  synths.
+
+### Tooling
+
+- The Kaitai schema decodes all four instrument record versions and rejects
+  a synth mixer strip of the wrong length.
+- The Kaitai schema's Ogg view is lazy, so a bad inner length fails
+  validation instead of container parsing.
+- `tests/fixtures/README.md` explains `expected_parse`.
+- `validate_public_tree.py` no longer writes `__pycache__`.
